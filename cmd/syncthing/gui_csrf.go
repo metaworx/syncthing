@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -37,6 +37,16 @@ func csrfMiddleware(unique string, prefix string, cfg config.GUIConfiguration, n
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Allow requests carrying a valid API key
 		if cfg.IsValidAPIKey(r.Header.Get("X-API-Key")) {
+			// Set the access-control-allow-origin header for CORS requests
+			// since a valid API key has been provided
+			w.Header().Add("Access-Control-Allow-Origin", "*")
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if strings.HasPrefix(r.URL.Path, "/rest/debug") {
+			// Debugging functions are only available when explicitly
+			// enabled, and can be accessed without a CSRF token
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -106,7 +116,7 @@ func saveCsrfTokens() {
 	// nothing relevant we can do about them anyway...
 
 	name := locations[locCsrfTokens]
-	f, err := osutil.CreateAtomic(name, 0600)
+	f, err := osutil.CreateAtomic(name)
 	if err != nil {
 		return
 	}

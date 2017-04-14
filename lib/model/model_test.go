@@ -2,13 +2,12 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package model
 
 import (
 	"bytes"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -18,17 +17,18 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/d4l3k/messagediff"
 	"github.com/syncthing/syncthing/lib/config"
-	"github.com/syncthing/syncthing/lib/connections"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	srand "github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/scanner"
 )
 
 var device1, device2 protocol.DeviceID
@@ -54,22 +54,22 @@ func init() {
 
 var testDataExpected = map[string]protocol.FileInfo{
 	"foo": {
-		Name:     "foo",
-		Type:     protocol.FileInfoTypeFile,
-		Modified: 0,
-		Blocks:   []protocol.BlockInfo{{Offset: 0x0, Size: 0x7, Hash: []uint8{0xae, 0xc0, 0x70, 0x64, 0x5f, 0xe5, 0x3e, 0xe3, 0xb3, 0x76, 0x30, 0x59, 0x37, 0x61, 0x34, 0xf0, 0x58, 0xcc, 0x33, 0x72, 0x47, 0xc9, 0x78, 0xad, 0xd1, 0x78, 0xb6, 0xcc, 0xdf, 0xb0, 0x1, 0x9f}}},
+		Name:      "foo",
+		Type:      protocol.FileInfoTypeFile,
+		ModifiedS: 0,
+		Blocks:    []protocol.BlockInfo{{Offset: 0x0, Size: 0x7, Hash: []uint8{0xae, 0xc0, 0x70, 0x64, 0x5f, 0xe5, 0x3e, 0xe3, 0xb3, 0x76, 0x30, 0x59, 0x37, 0x61, 0x34, 0xf0, 0x58, 0xcc, 0x33, 0x72, 0x47, 0xc9, 0x78, 0xad, 0xd1, 0x78, 0xb6, 0xcc, 0xdf, 0xb0, 0x1, 0x9f}}},
 	},
 	"empty": {
-		Name:     "empty",
-		Type:     protocol.FileInfoTypeFile,
-		Modified: 0,
-		Blocks:   []protocol.BlockInfo{{Offset: 0x0, Size: 0x0, Hash: []uint8{0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55}}},
+		Name:      "empty",
+		Type:      protocol.FileInfoTypeFile,
+		ModifiedS: 0,
+		Blocks:    []protocol.BlockInfo{{Offset: 0x0, Size: 0x0, Hash: []uint8{0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f, 0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b, 0x78, 0x52, 0xb8, 0x55}}},
 	},
 	"bar": {
-		Name:     "bar",
-		Type:     protocol.FileInfoTypeFile,
-		Modified: 0,
-		Blocks:   []protocol.BlockInfo{{Offset: 0x0, Size: 0xa, Hash: []uint8{0x2f, 0x72, 0xcc, 0x11, 0xa6, 0xfc, 0xd0, 0x27, 0x1e, 0xce, 0xf8, 0xc6, 0x10, 0x56, 0xee, 0x1e, 0xb1, 0x24, 0x3b, 0xe3, 0x80, 0x5b, 0xf9, 0xa9, 0xdf, 0x98, 0xf9, 0x2f, 0x76, 0x36, 0xb0, 0x5c}}},
+		Name:      "bar",
+		Type:      protocol.FileInfoTypeFile,
+		ModifiedS: 0,
+		Blocks:    []protocol.BlockInfo{{Offset: 0x0, Size: 0xa, Hash: []uint8{0x2f, 0x72, 0xcc, 0x11, 0xa6, 0xfc, 0xd0, 0x27, 0x1e, 0xce, 0xf8, 0xc6, 0x10, 0x56, 0xee, 0x1e, 0xb1, 0x24, 0x3b, 0xe3, 0x80, 0x5b, 0xf9, 0xa9, 0xdf, 0x98, 0xf9, 0x2f, 0x76, 0x36, 0xb0, 0x5c}}},
 	},
 }
 
@@ -78,7 +78,7 @@ func init() {
 	for n, f := range testDataExpected {
 		fi, _ := os.Stat("testdata/" + n)
 		f.Permissions = uint32(fi.Mode())
-		f.Modified = fi.ModTime().Unix()
+		f.ModifiedS = fi.ModTime().Unix()
 		f.Size = fi.Size()
 		testDataExpected[n] = f
 	}
@@ -93,6 +93,7 @@ func TestRequest(t *testing.T) {
 	m.AddFolder(defaultFolderConfig)
 	m.StartFolder("default")
 	m.ServeBackground()
+	defer m.Stop()
 	m.ScanFolder("default")
 
 	bs := make([]byte, protocol.BlockSize)
@@ -144,9 +145,10 @@ func genFiles(n int) []protocol.FileInfo {
 	t := time.Now().Unix()
 	for i := 0; i < n; i++ {
 		files[i] = protocol.FileInfo{
-			Name:     fmt.Sprintf("file%d", i),
-			Modified: t,
-			Blocks:   []protocol.BlockInfo{{Offset: 0, Size: 100, Hash: []byte("some hash bytes")}},
+			Name:      fmt.Sprintf("file%d", i),
+			ModifiedS: t,
+			Sequence:  int64(i + 1),
+			Blocks:    []protocol.BlockInfo{{Offset: 0, Size: 100, Hash: []byte("some hash bytes")}},
 		}
 	}
 
@@ -167,6 +169,7 @@ func benchmarkIndex(b *testing.B, nfiles int) {
 	m.AddFolder(defaultFolderConfig)
 	m.StartFolder("default")
 	m.ServeBackground()
+	defer m.Stop()
 
 	files := genFiles(nfiles)
 	m.Index(device1, "default", files)
@@ -196,6 +199,7 @@ func benchmarkIndexUpdate(b *testing.B, nfiles, nufiles int) {
 	m.AddFolder(defaultFolderConfig)
 	m.StartFolder("default")
 	m.ServeBackground()
+	defer m.Stop()
 
 	files := genFiles(nfiles)
 	ufiles := genFiles(nufiles)
@@ -214,94 +218,157 @@ type downloadProgressMessage struct {
 	updates []protocol.FileDownloadProgressUpdate
 }
 
-type FakeConnection struct {
+type fakeConnection struct {
 	id                       protocol.DeviceID
-	requestData              []byte
 	downloadProgressMessages []downloadProgressMessage
+	closed                   bool
+	files                    []protocol.FileInfo
+	fileData                 map[string][]byte
+	folder                   string
+	model                    *Model
+	indexFn                  func(string, []protocol.FileInfo)
+	requestFn                func(folder, name string, offset int64, size int, hash []byte, fromTemporary bool) ([]byte, error)
+	mut                      sync.Mutex
 }
 
-func (FakeConnection) Close() error {
+func (f *fakeConnection) Close() error {
+	f.mut.Lock()
+	defer f.mut.Unlock()
+	f.closed = true
 	return nil
 }
 
-func (f FakeConnection) Start() {
+func (f *fakeConnection) Start() {
 }
 
-func (f FakeConnection) ID() protocol.DeviceID {
+func (f *fakeConnection) ID() protocol.DeviceID {
 	return f.id
 }
 
-func (f FakeConnection) Name() string {
+func (f *fakeConnection) Name() string {
 	return ""
 }
 
-func (f FakeConnection) Option(string) string {
+func (f *fakeConnection) Option(string) string {
 	return ""
 }
 
-func (FakeConnection) Index(string, []protocol.FileInfo) error {
+func (f *fakeConnection) Index(folder string, fs []protocol.FileInfo) error {
+	f.mut.Lock()
+	defer f.mut.Unlock()
+	if f.indexFn != nil {
+		f.indexFn(folder, fs)
+	}
 	return nil
 }
 
-func (FakeConnection) IndexUpdate(string, []protocol.FileInfo) error {
+func (f *fakeConnection) IndexUpdate(folder string, fs []protocol.FileInfo) error {
+	f.mut.Lock()
+	defer f.mut.Unlock()
+	if f.indexFn != nil {
+		f.indexFn(folder, fs)
+	}
 	return nil
 }
 
-func (f FakeConnection) Request(folder, name string, offset int64, size int, hash []byte, fromTemporary bool) ([]byte, error) {
-	return f.requestData, nil
+func (f *fakeConnection) Request(folder, name string, offset int64, size int, hash []byte, fromTemporary bool) ([]byte, error) {
+	f.mut.Lock()
+	defer f.mut.Unlock()
+	if f.requestFn != nil {
+		return f.requestFn(folder, name, offset, size, hash, fromTemporary)
+	}
+	return f.fileData[name], nil
 }
 
-func (FakeConnection) ClusterConfig(protocol.ClusterConfig) {}
+func (f *fakeConnection) ClusterConfig(protocol.ClusterConfig) {}
 
-func (FakeConnection) Ping() bool {
-	return true
+func (f *fakeConnection) Ping() bool {
+	f.mut.Lock()
+	defer f.mut.Unlock()
+	return f.closed
 }
 
-func (FakeConnection) Closed() bool {
-	return false
+func (f *fakeConnection) Closed() bool {
+	f.mut.Lock()
+	defer f.mut.Unlock()
+	return f.closed
 }
 
-func (FakeConnection) Statistics() protocol.Statistics {
+func (f *fakeConnection) Statistics() protocol.Statistics {
 	return protocol.Statistics{}
 }
 
-func (f *FakeConnection) DownloadProgress(folder string, updates []protocol.FileDownloadProgressUpdate) {
+func (f *fakeConnection) RemoteAddr() net.Addr {
+	return &fakeAddr{}
+}
+
+func (f *fakeConnection) Type() string {
+	return "fake"
+}
+
+func (f *fakeConnection) DownloadProgress(folder string, updates []protocol.FileDownloadProgressUpdate) {
 	f.downloadProgressMessages = append(f.downloadProgressMessages, downloadProgressMessage{
 		folder:  folder,
 		updates: updates,
 	})
 }
 
-func BenchmarkRequest(b *testing.B) {
+func (f *fakeConnection) addFile(name string, flags uint32, ftype protocol.FileInfoType, data []byte) {
+	f.mut.Lock()
+	defer f.mut.Unlock()
+
+	blocks, _ := scanner.Blocks(bytes.NewReader(data), protocol.BlockSize, int64(len(data)), nil, true)
+	var version protocol.Vector
+	version = version.Update(f.id.Short())
+
+	if ftype == protocol.FileInfoTypeFile || ftype == protocol.FileInfoTypeDirectory {
+		f.files = append(f.files, protocol.FileInfo{
+			Name:        name,
+			Type:        ftype,
+			Size:        int64(len(data)),
+			ModifiedS:   time.Now().Unix(),
+			Permissions: flags,
+			Version:     version,
+			Sequence:    time.Now().UnixNano(),
+			Blocks:      blocks,
+		})
+	} else {
+		// Symlink
+		f.files = append(f.files, protocol.FileInfo{
+			Name:          name,
+			Type:          ftype,
+			Version:       version,
+			Sequence:      time.Now().UnixNano(),
+			SymlinkTarget: string(data),
+		})
+	}
+
+	if f.fileData == nil {
+		f.fileData = make(map[string][]byte)
+	}
+	f.fileData[name] = data
+}
+
+func (f *fakeConnection) sendIndexUpdate() {
+	f.model.IndexUpdate(f.id, f.folder, f.files)
+}
+
+func BenchmarkRequestOut(b *testing.B) {
 	db := db.OpenMemory()
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 	m.ServeBackground()
+	defer m.Stop()
 	m.ScanFolder("default")
 
 	const n = 1000
-	files := make([]protocol.FileInfo, n)
-	t := time.Now().Unix()
-	for i := 0; i < n; i++ {
-		files[i] = protocol.FileInfo{
-			Name:     fmt.Sprintf("file%d", i),
-			Modified: t,
-			Blocks:   []protocol.BlockInfo{{Offset: 0, Size: 100, Hash: []byte("some hash bytes")}},
-		}
-	}
+	files := genFiles(n)
 
-	fc := &FakeConnection{
-		id:          device1,
-		requestData: []byte("some data to return"),
+	fc := &fakeConnection{id: device1}
+	for _, f := range files {
+		fc.addFile(f.Name, 0644, protocol.FileInfoTypeFile, []byte("some data to return"))
 	}
-	m.AddConnection(connections.Connection{
-		IntermediateConnection: connections.IntermediateConnection{
-			Conn:     tls.Client(&fakeConn{}, nil),
-			Type:     "foo",
-			Priority: 10,
-		},
-		Connection: fc,
-	}, protocol.HelloResult{})
+	m.AddConnection(fc, protocol.HelloResult{})
 	m.Index(device1, "default", files)
 
 	b.ResetTimer()
@@ -314,6 +381,32 @@ func BenchmarkRequest(b *testing.B) {
 			b.Error("nil data")
 		}
 	}
+}
+
+func BenchmarkRequestInSingleFile(b *testing.B) {
+	db := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
+	m.AddFolder(defaultFolderConfig)
+	m.ServeBackground()
+	defer m.Stop()
+	m.ScanFolder("default")
+
+	buf := make([]byte, 128<<10)
+	rand.Read(buf)
+	os.RemoveAll("testdata/request")
+	defer os.RemoveAll("testdata/request")
+	os.MkdirAll("testdata/request/for/a/file/in/a/couple/of/dirs", 0755)
+	ioutil.WriteFile("testdata/request/for/a/file/in/a/couple/of/dirs/128k", buf, 0644)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if err := m.Request(device1, "default", "request/for/a/file/in/a/couple/of/dirs/128k", 0, nil, false, buf); err != nil {
+			b.Error(err)
+		}
+	}
+
+	b.SetBytes(128 << 10)
 }
 
 func TestDeviceRename(t *testing.T) {
@@ -338,27 +431,18 @@ func TestDeviceRename(t *testing.T) {
 		t.Errorf("Device already has a name")
 	}
 
-	conn := connections.Connection{
-		IntermediateConnection: connections.IntermediateConnection{
-			Conn:     tls.Client(&fakeConn{}, nil),
-			Type:     "foo",
-			Priority: 10,
-		},
-		Connection: &FakeConnection{
-			id:          device1,
-			requestData: []byte("some data to return"),
-		},
-	}
+	conn := &fakeConnection{id: device1}
 
 	m.AddConnection(conn, hello)
 
 	m.ServeBackground()
+	defer m.Stop()
 
 	if cfg.Devices()[device1].Name != "" {
 		t.Errorf("Device already has a name")
 	}
 
-	m.Close(device1, protocol.ErrTimeout)
+	m.Closed(conn, protocol.ErrTimeout)
 	hello.DeviceName = "tester"
 	m.AddConnection(conn, hello)
 
@@ -366,7 +450,7 @@ func TestDeviceRename(t *testing.T) {
 		t.Errorf("Device did not get a name")
 	}
 
-	m.Close(device1, protocol.ErrTimeout)
+	m.Closed(conn, protocol.ErrTimeout)
 	hello.DeviceName = "tester2"
 	m.AddConnection(conn, hello)
 
@@ -383,7 +467,7 @@ func TestDeviceRename(t *testing.T) {
 		t.Errorf("Device name not saved in config")
 	}
 
-	m.Close(device1, protocol.ErrTimeout)
+	m.Closed(conn, protocol.ErrTimeout)
 
 	opts := cfg.Options()
 	opts.OverwriteRemoteDevNames = true
@@ -431,6 +515,7 @@ func TestClusterConfig(t *testing.T) {
 	m.AddFolder(cfg.Folders[0])
 	m.AddFolder(cfg.Folders[1])
 	m.ServeBackground()
+	defer m.Stop()
 
 	cm := m.generateClusterConfig(device2)
 
@@ -445,14 +530,14 @@ func TestClusterConfig(t *testing.T) {
 	if l := len(r.Devices); l != 2 {
 		t.Errorf("Incorrect number of devices %d != 2", l)
 	}
-	if id := r.Devices[0].ID; !bytes.Equal(id, device1[:]) {
-		t.Errorf("Incorrect device ID %x != %x", id, device1)
+	if id := r.Devices[0].ID; id != device1 {
+		t.Errorf("Incorrect device ID %s != %s", id, device1)
 	}
 	if !r.Devices[0].Introducer {
 		t.Error("Device1 should be flagged as Introducer")
 	}
-	if id := r.Devices[1].ID; !bytes.Equal(id, device2[:]) {
-		t.Errorf("Incorrect device ID %x != %x", id, device2)
+	if id := r.Devices[1].ID; id != device2 {
+		t.Errorf("Incorrect device ID %s != %s", id, device2)
 	}
 	if r.Devices[1].Introducer {
 		t.Error("Device2 should not be flagged as Introducer")
@@ -465,17 +550,380 @@ func TestClusterConfig(t *testing.T) {
 	if l := len(r.Devices); l != 2 {
 		t.Errorf("Incorrect number of devices %d != 2", l)
 	}
-	if id := r.Devices[0].ID; !bytes.Equal(id, device1[:]) {
-		t.Errorf("Incorrect device ID %x != %x", id, device1)
+	if id := r.Devices[0].ID; id != device1 {
+		t.Errorf("Incorrect device ID %s != %s", id, device1)
 	}
 	if !r.Devices[0].Introducer {
 		t.Error("Device1 should be flagged as Introducer")
 	}
-	if id := r.Devices[1].ID; !bytes.Equal(id, device2[:]) {
-		t.Errorf("Incorrect device ID %x != %x", id, device2)
+	if id := r.Devices[1].ID; id != device2 {
+		t.Errorf("Incorrect device ID %s != %s", id, device2)
 	}
 	if r.Devices[1].Introducer {
 		t.Error("Device2 should not be flagged as Introducer")
+	}
+}
+
+func TestIntroducer(t *testing.T) {
+	var introducedByAnyone protocol.DeviceID
+
+	// LocalDeviceID is a magic value meaning don't check introducer
+	contains := func(cfg config.FolderConfiguration, id, introducedBy protocol.DeviceID) bool {
+		for _, dev := range cfg.Devices {
+			if dev.DeviceID.Equals(id) {
+				if introducedBy.Equals(introducedByAnyone) {
+					return true
+				}
+				return introducedBy.Equals(introducedBy)
+			}
+		}
+		return false
+	}
+
+	newState := func(cfg config.Configuration) (*config.Wrapper, *Model) {
+		db := db.OpenMemory()
+
+		wcfg := config.Wrap("/tmp/test", cfg)
+
+		m := NewModel(wcfg, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
+		for _, folder := range cfg.Folders {
+			m.AddFolder(folder)
+		}
+		m.ServeBackground()
+		m.AddConnection(&fakeConnection{id: device1}, protocol.HelloResult{})
+		return wcfg, m
+	}
+
+	wcfg, m := newState(config.Configuration{
+		Devices: []config.DeviceConfiguration{
+			{
+				DeviceID:   device1,
+				Introducer: true,
+			},
+		},
+		Folders: []config.FolderConfiguration{
+			{
+				ID: "folder1",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+				},
+			},
+			{
+				ID: "folder2",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device1, protocol.ClusterConfig{
+		Folders: []protocol.Folder{
+			{
+				ID: "folder1",
+				Devices: []protocol.Device{
+					{
+						ID:                       device2,
+						Introducer:               true,
+						SkipIntroductionRemovals: true,
+					},
+				},
+			},
+		},
+	})
+
+	if newDev, ok := wcfg.Device(device2); !ok || !newDev.Introducer || !newDev.SkipIntroductionRemovals {
+		t.Error("devie 2 missing or wrong flags")
+	}
+
+	if !contains(wcfg.Folders()["folder1"], device2, device1) {
+		t.Error("expected folder 1 to have device2 introduced by device 1")
+	}
+
+	wcfg, m = newState(config.Configuration{
+		Devices: []config.DeviceConfiguration{
+			{
+				DeviceID:   device1,
+				Introducer: true,
+			},
+			{
+				DeviceID:     device2,
+				IntroducedBy: device1,
+			},
+		},
+		Folders: []config.FolderConfiguration{
+			{
+				ID: "folder1",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+			{
+				ID: "folder2",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device1, protocol.ClusterConfig{
+		Folders: []protocol.Folder{
+			{
+				ID: "folder2",
+				Devices: []protocol.Device{
+					{
+						ID:                       device2,
+						Introducer:               true,
+						SkipIntroductionRemovals: true,
+					},
+				},
+			},
+		},
+	})
+
+	// Should not get introducer, as it's already unset, and it's an existing device.
+	if newDev, ok := wcfg.Device(device2); !ok || newDev.Introducer || newDev.SkipIntroductionRemovals {
+		t.Error("device 2 missing or changed flags")
+	}
+
+	if contains(wcfg.Folders()["folder1"], device2, introducedByAnyone) {
+		t.Error("expected device 2 to be removed from folder 1")
+	}
+
+	if !contains(wcfg.Folders()["folder2"], device2, device1) {
+		t.Error("expected device 2 to be added to folder 2")
+	}
+
+	wcfg, m = newState(config.Configuration{
+		Devices: []config.DeviceConfiguration{
+			{
+				DeviceID:   device1,
+				Introducer: true,
+			},
+			{
+				DeviceID:     device2,
+				IntroducedBy: device1,
+			},
+		},
+		Folders: []config.FolderConfiguration{
+			{
+				ID: "folder1",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+			{
+				ID: "folder2",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device1, protocol.ClusterConfig{})
+
+	if _, ok := wcfg.Device(device2); ok {
+		t.Error("device 2 should have been removed")
+	}
+
+	if contains(wcfg.Folders()["folder1"], device2, introducedByAnyone) {
+		t.Error("expected device 2 to be removed from folder 1")
+	}
+
+	if contains(wcfg.Folders()["folder2"], device2, introducedByAnyone) {
+		t.Error("expected device 2 to be removed from folder 2")
+	}
+
+	// Two cases when removals should not happen
+	// 1. Introducer flag no longer set on device
+
+	wcfg, m = newState(config.Configuration{
+		Devices: []config.DeviceConfiguration{
+			{
+				DeviceID:   device1,
+				Introducer: false,
+			},
+			{
+				DeviceID:     device2,
+				IntroducedBy: device1,
+			},
+		},
+		Folders: []config.FolderConfiguration{
+			{
+				ID: "folder1",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+			{
+				ID: "folder2",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device1, protocol.ClusterConfig{})
+
+	if _, ok := wcfg.Device(device2); !ok {
+		t.Error("device 2 should not have been removed")
+	}
+
+	if !contains(wcfg.Folders()["folder1"], device2, device1) {
+		t.Error("expected device 2 not to be removed from folder 1")
+	}
+
+	if !contains(wcfg.Folders()["folder2"], device2, device1) {
+		t.Error("expected device 2 not to be removed from folder 2")
+	}
+
+	// 2. SkipIntroductionRemovals is set
+
+	wcfg, m = newState(config.Configuration{
+		Devices: []config.DeviceConfiguration{
+			{
+				DeviceID:                 device1,
+				Introducer:               true,
+				SkipIntroductionRemovals: true,
+			},
+			{
+				DeviceID:     device2,
+				IntroducedBy: device1,
+			},
+		},
+		Folders: []config.FolderConfiguration{
+			{
+				ID: "folder1",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+			{
+				ID: "folder2",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device1, protocol.ClusterConfig{
+		Folders: []protocol.Folder{
+			{
+				ID: "folder2",
+				Devices: []protocol.Device{
+					{
+						ID:                       device2,
+						Introducer:               true,
+						SkipIntroductionRemovals: true,
+					},
+				},
+			},
+		},
+	})
+
+	if _, ok := wcfg.Device(device2); !ok {
+		t.Error("device 2 should not have been removed")
+	}
+
+	if !contains(wcfg.Folders()["folder1"], device2, device1) {
+		t.Error("expected device 2 not to be removed from folder 1")
+	}
+
+	if !contains(wcfg.Folders()["folder2"], device2, device1) {
+		t.Error("expected device 2 not to be added to folder 2")
+	}
+
+	// Test device not being removed as it's shared without an introducer.
+
+	wcfg, m = newState(config.Configuration{
+		Devices: []config.DeviceConfiguration{
+			{
+				DeviceID:   device1,
+				Introducer: true,
+			},
+			{
+				DeviceID:     device2,
+				IntroducedBy: device1,
+			},
+		},
+		Folders: []config.FolderConfiguration{
+			{
+				ID: "folder1",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+			{
+				ID: "folder2",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device1, protocol.ClusterConfig{})
+
+	if _, ok := wcfg.Device(device2); !ok {
+		t.Error("device 2 should not have been removed")
+	}
+
+	if contains(wcfg.Folders()["folder1"], device2, introducedByAnyone) {
+		t.Error("expected device 2 to be removed from folder 1")
+	}
+
+	if !contains(wcfg.Folders()["folder2"], device2, introducedByAnyone) {
+		t.Error("expected device 2 not to be removed from folder 2")
+	}
+
+	// Test device not being removed as it's shared by a different introducer.
+
+	wcfg, m = newState(config.Configuration{
+		Devices: []config.DeviceConfiguration{
+			{
+				DeviceID:   device1,
+				Introducer: true,
+			},
+			{
+				DeviceID:     device2,
+				IntroducedBy: device1,
+			},
+		},
+		Folders: []config.FolderConfiguration{
+			{
+				ID: "folder1",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: device1},
+				},
+			},
+			{
+				ID: "folder2",
+				Devices: []config.FolderDeviceConfiguration{
+					{DeviceID: device1},
+					{DeviceID: device2, IntroducedBy: protocol.LocalDeviceID},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device1, protocol.ClusterConfig{})
+
+	if _, ok := wcfg.Device(device2); !ok {
+		t.Error("device 2 should not have been removed")
+	}
+
+	if contains(wcfg.Folders()["folder1"], device2, introducedByAnyone) {
+		t.Error("expected device 2 to be removed from folder 1")
+	}
+
+	if !contains(wcfg.Folders()["folder2"], device2, introducedByAnyone) {
+		t.Error("expected device 2 not to be removed from folder 2")
 	}
 }
 
@@ -502,6 +950,7 @@ func TestIgnores(t *testing.T) {
 	m.AddFolder(defaultFolderConfig)
 	m.StartFolder("default")
 	m.ServeBackground()
+	defer m.Stop()
 
 	expected := []string{
 		".*",
@@ -551,7 +1000,7 @@ func TestIgnores(t *testing.T) {
 		t.Errorf("Incorrect ignores: %v != %v", ignores, expected)
 	}
 
-	ignores, _, err = m.GetIgnores("doesnotexist")
+	_, _, err = m.GetIgnores("doesnotexist")
 	if err == nil {
 		t.Error("No error")
 	}
@@ -563,7 +1012,7 @@ func TestIgnores(t *testing.T) {
 
 	// Invalid path, marker should be missing, hence returns an error.
 	m.AddFolder(config.FolderConfiguration{ID: "fresh", RawPath: "XXX"})
-	ignores, _, err = m.GetIgnores("fresh")
+	_, _, err = m.GetIgnores("fresh")
 	if err == nil {
 		t.Error("No error")
 	}
@@ -579,7 +1028,7 @@ func TestROScanRecovery(t *testing.T) {
 	fcfg := config.FolderConfiguration{
 		ID:              "default",
 		RawPath:         "testdata/rotestfolder",
-		Type:            config.FolderTypeReadOnly,
+		Type:            config.FolderTypeSendOnly,
 		RescanIntervalS: 1,
 	}
 	cfg := config.Wrap("/tmp/test", config.Configuration{
@@ -597,6 +1046,7 @@ func TestROScanRecovery(t *testing.T) {
 	m.AddFolder(fcfg)
 	m.StartFolder("default")
 	m.ServeBackground()
+	defer m.Stop()
 
 	waitFor := func(status string) error {
 		timeout := time.Now().Add(2 * time.Second)
@@ -665,7 +1115,7 @@ func TestRWScanRecovery(t *testing.T) {
 	fcfg := config.FolderConfiguration{
 		ID:              "default",
 		RawPath:         "testdata/rwtestfolder",
-		Type:            config.FolderTypeReadWrite,
+		Type:            config.FolderTypeSendReceive,
 		RescanIntervalS: 1,
 	}
 	cfg := config.Wrap("/tmp/test", config.Configuration{
@@ -683,6 +1133,7 @@ func TestRWScanRecovery(t *testing.T) {
 	m.AddFolder(fcfg)
 	m.StartFolder("default")
 	m.ServeBackground()
+	defer m.Stop()
 
 	waitFor := func(status string) error {
 		timeout := time.Now().Add(2 * time.Second)
@@ -746,6 +1197,7 @@ func TestGlobalDirectoryTree(t *testing.T) {
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 	m.AddFolder(defaultFolderConfig)
 	m.ServeBackground()
+	defer m.Stop()
 
 	b := func(isfile bool, path ...string) protocol.FileInfo {
 		typ := protocol.FileInfoTypeDirectory
@@ -755,11 +1207,11 @@ func TestGlobalDirectoryTree(t *testing.T) {
 			blocks = []protocol.BlockInfo{{Offset: 0x0, Size: 0xa, Hash: []uint8{0x2f, 0x72, 0xcc, 0x11, 0xa6, 0xfc, 0xd0, 0x27, 0x1e, 0xce, 0xf8, 0xc6, 0x10, 0x56, 0xee, 0x1e, 0xb1, 0x24, 0x3b, 0xe3, 0x80, 0x5b, 0xf9, 0xa9, 0xdf, 0x98, 0xf9, 0x2f, 0x76, 0x36, 0xb0, 0x5c}}}
 		}
 		return protocol.FileInfo{
-			Name:     filepath.Join(path...),
-			Type:     typ,
-			Modified: 0x666,
-			Blocks:   blocks,
-			Size:     0xa,
+			Name:      filepath.Join(path...),
+			Type:      typ,
+			ModifiedS: 0x666,
+			Blocks:    blocks,
+			Size:      0xa,
 		}
 	}
 
@@ -1006,11 +1458,11 @@ func TestGlobalDirectorySelfFixing(t *testing.T) {
 			blocks = []protocol.BlockInfo{{Offset: 0x0, Size: 0xa, Hash: []uint8{0x2f, 0x72, 0xcc, 0x11, 0xa6, 0xfc, 0xd0, 0x27, 0x1e, 0xce, 0xf8, 0xc6, 0x10, 0x56, 0xee, 0x1e, 0xb1, 0x24, 0x3b, 0xe3, 0x80, 0x5b, 0xf9, 0xa9, 0xdf, 0x98, 0xf9, 0x2f, 0x76, 0x36, 0xb0, 0x5c}}}
 		}
 		return protocol.FileInfo{
-			Name:     filepath.Join(path...),
-			Type:     typ,
-			Modified: 0x666,
-			Blocks:   blocks,
-			Size:     0xa,
+			Name:      filepath.Join(path...),
+			Type:      typ,
+			ModifiedS: 0x666,
+			Blocks:    blocks,
+			Size:      0xa,
 		}
 	}
 
@@ -1148,7 +1600,7 @@ func genDeepFiles(n, d int) []protocol.FileInfo {
 			i++
 		}
 
-		files[i].Modified = t
+		files[i].ModifiedS = t
 		files[i].Blocks = []protocol.BlockInfo{{Offset: 0, Size: 100, Hash: []byte("some hash bytes")}}
 	}
 
@@ -1183,43 +1635,6 @@ func benchmarkTree(b *testing.B, n1, n2 int) {
 		m.GlobalDirectoryTree("default", "", -1, false)
 	}
 	b.ReportAllocs()
-}
-
-func TestIgnoreDelete(t *testing.T) {
-	db := db.OpenMemory()
-	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
-
-	// This folder should ignore external deletes
-	cfg := defaultFolderConfig
-	cfg.IgnoreDelete = true
-
-	m.AddFolder(cfg)
-	m.ServeBackground()
-	m.StartFolder("default")
-	m.ScanFolder("default")
-
-	// Get a currently existing file
-	f, ok := m.CurrentGlobalFile("default", "foo")
-	if !ok {
-		t.Fatal("foo should exist")
-	}
-
-	// Mark it for deletion
-	f.Deleted = true
-	f.Version = f.Version.Update(142) // arbitrary short remote ID
-	f.Blocks = nil
-
-	// Send the index
-	m.Index(device1, "default", []protocol.FileInfo{f})
-
-	// Make sure we ignored it
-	f, ok = m.CurrentGlobalFile("default", "foo")
-	if !ok {
-		t.Fatal("foo should exist")
-	}
-	if f.IsDeleted() {
-		t.Fatal("foo should not be marked for deletion")
-	}
 }
 
 func TestUnifySubs(t *testing.T) {
@@ -1348,18 +1763,18 @@ func TestIssue3028(t *testing.T) {
 	m.StartFolder("default")
 	m.ServeBackground()
 
-	// Ugly hack for testing: reach into the model for the rwfolder and wait
+	// Ugly hack for testing: reach into the model for the SendReceiveFolder and wait
 	// for it to complete the initial scan. The risk is that it otherwise
 	// runs during our modifications and screws up the test.
 	m.fmut.RLock()
-	folder := m.folderRunners["default"].(*rwFolder)
+	folder := m.folderRunners["default"].(*sendReceiveFolder)
 	m.fmut.RUnlock()
 	<-folder.initialScanCompleted
 
 	// Get a count of how many files are there now
 
-	locorigfiles, _, _ := m.LocalSize("default")
-	globorigfiles, _, _ := m.GlobalSize("default")
+	locorigfiles := m.LocalSize("default").Files
+	globorigfiles := m.GlobalSize("default").Files
 
 	// Delete and rescan specifically these two
 
@@ -1370,25 +1785,25 @@ func TestIssue3028(t *testing.T) {
 	// Verify that the number of files decreased by two and the number of
 	// deleted files increases by two
 
-	locnowfiles, locdelfiles, _ := m.LocalSize("default")
-	globnowfiles, globdelfiles, _ := m.GlobalSize("default")
-	if locnowfiles != locorigfiles-2 {
-		t.Errorf("Incorrect local accounting; got %d current files, expected %d", locnowfiles, locorigfiles-2)
+	loc := m.LocalSize("default")
+	glob := m.GlobalSize("default")
+	if loc.Files != locorigfiles-2 {
+		t.Errorf("Incorrect local accounting; got %d current files, expected %d", loc.Files, locorigfiles-2)
 	}
-	if globnowfiles != globorigfiles-2 {
-		t.Errorf("Incorrect global accounting; got %d current files, expected %d", globnowfiles, globorigfiles-2)
+	if glob.Files != globorigfiles-2 {
+		t.Errorf("Incorrect global accounting; got %d current files, expected %d", glob.Files, globorigfiles-2)
 	}
-	if locdelfiles != 2 {
-		t.Errorf("Incorrect local accounting; got %d deleted files, expected 2", locdelfiles)
+	if loc.Deleted != 2 {
+		t.Errorf("Incorrect local accounting; got %d deleted files, expected 2", loc.Deleted)
 	}
-	if globdelfiles != 2 {
-		t.Errorf("Incorrect global accounting; got %d deleted files, expected 2", globdelfiles)
+	if glob.Deleted != 2 {
+		t.Errorf("Incorrect global accounting; got %d deleted files, expected 2", glob.Deleted)
 	}
 }
 
 func TestIssue3164(t *testing.T) {
-	osutil.RemoveAll("testdata/issue3164")
-	defer osutil.RemoveAll("testdata/issue3164")
+	os.RemoveAll("testdata/issue3164")
+	defer os.RemoveAll("testdata/issue3164")
 
 	if err := os.MkdirAll("testdata/issue3164/oktodelete/foobar", 0777); err != nil {
 		t.Fatal(err)
@@ -1407,7 +1822,7 @@ func TestIssue3164(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fl := rwFolder{
+	fl := sendReceiveFolder{
 		dbUpdates: make(chan dbUpdateJob, 1),
 		dir:       "testdata",
 	}
@@ -1437,6 +1852,8 @@ func TestScanNoDatabaseWrite(t *testing.T) {
 	}
 	defer m.SetIgnores("default", curIgn)
 	m.SetIgnores("default", nil)
+	fakeTime := time.Now().Add(5 * time.Second)
+	os.Chtimes("testdata/.stignore", fakeTime, fakeTime)
 
 	// Scan the folder twice. The second scan should be a no-op database wise
 
@@ -1453,6 +1870,8 @@ func TestScanNoDatabaseWrite(t *testing.T) {
 	// Ignore a file we know exists. It'll be updated in the database.
 
 	m.SetIgnores("default", []string{"foo"})
+	fakeTime = time.Now().Add(10 * time.Second)
+	os.Chtimes("testdata/.stignore", fakeTime, fakeTime)
 
 	m.ScanFolder("default")
 	c2 := db.Committed()
@@ -1489,7 +1908,7 @@ func TestIssue2782(t *testing.T) {
 
 	testName := ".syncthing-test." + srand.String(16)
 	testDir := filepath.Join(home, testName)
-	if err := osutil.RemoveAll(testDir); err != nil {
+	if err := os.RemoveAll(testDir); err != nil {
 		t.Skip(err)
 	}
 	if err := osutil.MkdirAll(testDir+"/syncdir", 0755); err != nil {
@@ -1501,7 +1920,7 @@ func TestIssue2782(t *testing.T) {
 	if err := os.Symlink("syncdir", testDir+"/synclink"); err != nil {
 		t.Skip(err)
 	}
-	defer osutil.RemoveAll(testDir)
+	defer os.RemoveAll(testDir)
 
 	db := db.OpenMemory()
 	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
@@ -1519,6 +1938,523 @@ func TestIssue2782(t *testing.T) {
 	}
 }
 
+func TestIndexesForUnknownDevicesDropped(t *testing.T) {
+	dbi := db.OpenMemory()
+
+	files := db.NewFileSet("default", dbi)
+	files.Replace(device1, genFiles(1))
+	files.Replace(device2, genFiles(1))
+
+	if len(files.ListDevices()) != 2 {
+		t.Error("expected two devices")
+	}
+
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", dbi, nil)
+	m.AddFolder(defaultFolderConfig)
+	m.StartFolder("default")
+
+	// Remote sequence is cached, hence need to recreated.
+	files = db.NewFileSet("default", dbi)
+
+	if len(files.ListDevices()) != 1 {
+		t.Error("Expected one device")
+	}
+}
+
+func TestSharedWithClearedOnDisconnect(t *testing.T) {
+	dbi := db.OpenMemory()
+
+	fcfg := config.NewFolderConfiguration("default", "testdata")
+	fcfg.Devices = []config.FolderDeviceConfiguration{
+		{DeviceID: device1},
+		{DeviceID: device2},
+	}
+	cfg := config.Configuration{
+		Folders: []config.FolderConfiguration{fcfg},
+		Devices: []config.DeviceConfiguration{
+			config.NewDeviceConfiguration(device1, "device1"),
+			config.NewDeviceConfiguration(device2, "device2"),
+		},
+		Options: config.OptionsConfiguration{
+			// Don't remove temporaries directly on startup
+			KeepTemporariesH: 1,
+		},
+	}
+
+	wcfg := config.Wrap("/tmp/test", cfg)
+
+	m := NewModel(wcfg, protocol.LocalDeviceID, "device", "syncthing", "dev", dbi, nil)
+	m.AddFolder(fcfg)
+	m.StartFolder(fcfg.ID)
+	m.ServeBackground()
+
+	conn1 := &fakeConnection{id: device1}
+	m.AddConnection(conn1, protocol.HelloResult{})
+	conn2 := &fakeConnection{id: device2}
+	m.AddConnection(conn2, protocol.HelloResult{})
+
+	m.ClusterConfig(device1, protocol.ClusterConfig{
+		Folders: []protocol.Folder{
+			{
+				ID: "default",
+				Devices: []protocol.Device{
+					{ID: device1},
+					{ID: device2},
+				},
+			},
+		},
+	})
+	m.ClusterConfig(device2, protocol.ClusterConfig{
+		Folders: []protocol.Folder{
+			{
+				ID: "default",
+				Devices: []protocol.Device{
+					{ID: device1},
+					{ID: device2},
+				},
+			},
+		},
+	})
+
+	if !m.folderSharedWith("default", device1) {
+		t.Error("not shared with device1")
+	}
+	if !m.folderSharedWith("default", device2) {
+		t.Error("not shared with device2")
+	}
+
+	if conn2.Closed() {
+		t.Error("conn already closed")
+	}
+
+	cfg = cfg.Copy()
+	cfg.Devices = cfg.Devices[:1]
+
+	if err := wcfg.Replace(cfg); err != nil {
+		t.Error(err)
+	}
+
+	time.Sleep(100 * time.Millisecond) // Committer notification happens in a separate routine
+
+	if !m.folderSharedWith("default", device1) {
+		t.Error("not shared with device1")
+	}
+	if m.folderSharedWith("default", device2) { // checks m.deviceFolders
+		t.Error("shared with device2")
+	}
+
+	if !conn2.Closed() {
+		t.Error("connection not closed")
+	}
+
+	if _, ok := wcfg.Devices()[device2]; ok {
+		t.Error("device still in config")
+	}
+
+	fdevs, ok := m.folderDevices["default"]
+	if !ok {
+		t.Error("folder missing?")
+	}
+
+	for id := range fdevs {
+		if id == device2 {
+			t.Error("still there")
+		}
+	}
+
+	if _, ok := m.conn[device2]; !ok {
+		t.Error("conn missing early")
+	}
+
+	if _, ok := m.helloMessages[device2]; !ok {
+		t.Error("hello missing early")
+	}
+
+	if _, ok := m.deviceDownloads[device2]; !ok {
+		t.Error("downloads missing early")
+	}
+
+	m.Closed(conn2, fmt.Errorf("foo"))
+
+	if _, ok := m.conn[device2]; ok {
+		t.Error("conn not missing")
+	}
+
+	if _, ok := m.helloMessages[device2]; ok {
+		t.Error("hello not missing")
+	}
+
+	if _, ok := m.deviceDownloads[device2]; ok {
+		t.Error("downloads not missing")
+	}
+}
+
+func TestIssue3496(t *testing.T) {
+	t.Skip("This test deletes files that the other test depend on. Needs fixing.")
+
+	// It seems like lots of deleted files can cause negative completion
+	// percentages. Lets make sure that doesn't happen. Also do some general
+	// checks on the completion calculation stuff.
+
+	dbi := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", dbi, nil)
+	m.AddFolder(defaultFolderConfig)
+	m.StartFolder("default")
+	m.ServeBackground()
+	defer m.Stop()
+
+	m.ScanFolder("default")
+
+	addFakeConn(m, device1)
+	addFakeConn(m, device2)
+
+	// Reach into the model and grab the current file list...
+
+	m.fmut.RLock()
+	fs := m.folderFiles["default"]
+	m.fmut.RUnlock()
+	var localFiles []protocol.FileInfo
+	fs.WithHave(protocol.LocalDeviceID, func(i db.FileIntf) bool {
+		localFiles = append(localFiles, i.(protocol.FileInfo))
+		return true
+	})
+
+	// Mark all files as deleted and fake it as update from device1
+
+	for i := range localFiles {
+		localFiles[i].Deleted = true
+		localFiles[i].Version = localFiles[i].Version.Update(device1.Short())
+		localFiles[i].Blocks = nil
+	}
+
+	// Also add a small file that we're supposed to need, or the global size
+	// stuff will bail out early due to the entire folder being zero size.
+
+	localFiles = append(localFiles, protocol.FileInfo{
+		Name:    "fake",
+		Size:    1234,
+		Type:    protocol.FileInfoTypeFile,
+		Version: protocol.Vector{Counters: []protocol.Counter{{ID: device1.Short(), Value: 42}}},
+	})
+
+	m.IndexUpdate(device1, "default", localFiles)
+
+	// Check that the completion percentage for us makes sense
+
+	comp := m.Completion(protocol.LocalDeviceID, "default")
+	if comp.NeedBytes > comp.GlobalBytes {
+		t.Errorf("Need more bytes than exist, not possible: %d > %d", comp.NeedBytes, comp.GlobalBytes)
+	}
+	if comp.CompletionPct < 0 {
+		t.Errorf("Less than zero percent complete, not possible: %.02f%%", comp.CompletionPct)
+	}
+	if comp.NeedBytes == 0 {
+		t.Error("Need no bytes even though some files are deleted")
+	}
+	if comp.CompletionPct == 100 {
+		t.Errorf("Fully complete, not possible: %.02f%%", comp.CompletionPct)
+	}
+	t.Log(comp)
+
+	// Check that NeedSize does the correct thing
+	need := m.NeedSize("default")
+	if need.Files != 1 || need.Bytes != 1234 {
+		// The one we added synthetically above
+		t.Errorf("Incorrect need size; %d, %d != 1, 1234", need.Files, need.Bytes)
+	}
+	if need.Deleted != len(localFiles)-1 {
+		// The rest
+		t.Errorf("Incorrect need deletes; %d != %d", need.Deleted, len(localFiles)-1)
+	}
+}
+
+func TestIssue3804(t *testing.T) {
+	dbi := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", dbi, nil)
+	m.AddFolder(defaultFolderConfig)
+	m.StartFolder("default")
+	m.ServeBackground()
+	defer m.Stop()
+
+	// Subdirs ending in slash should be accepted
+
+	if err := m.ScanFolderSubdirs("default", []string{"baz/", "foo"}); err != nil {
+		t.Error("Unexpected error:", err)
+	}
+}
+
+func TestIssue3829(t *testing.T) {
+	dbi := db.OpenMemory()
+	m := NewModel(defaultConfig, protocol.LocalDeviceID, "device", "syncthing", "dev", dbi, nil)
+	m.AddFolder(defaultFolderConfig)
+	m.StartFolder("default")
+	m.ServeBackground()
+	defer m.Stop()
+
+	// Empty subdirs should be accepted
+
+	if err := m.ScanFolderSubdirs("default", []string{""}); err != nil {
+		t.Error("Unexpected error:", err)
+	}
+}
+
+func TestNoRequestsFromPausedDevices(t *testing.T) {
+	t.Skip("broken, fails randomly, #3843")
+
+	dbi := db.OpenMemory()
+
+	fcfg := config.NewFolderConfiguration("default", "testdata")
+	fcfg.Devices = []config.FolderDeviceConfiguration{
+		{DeviceID: device1},
+		{DeviceID: device2},
+	}
+	cfg := config.Configuration{
+		Folders: []config.FolderConfiguration{fcfg},
+		Devices: []config.DeviceConfiguration{
+			config.NewDeviceConfiguration(device1, "device1"),
+			config.NewDeviceConfiguration(device2, "device2"),
+		},
+		Options: config.OptionsConfiguration{
+			// Don't remove temporaries directly on startup
+			KeepTemporariesH: 1,
+		},
+	}
+
+	wcfg := config.Wrap("/tmp/test", cfg)
+
+	m := NewModel(wcfg, protocol.LocalDeviceID, "device", "syncthing", "dev", dbi, nil)
+	m.AddFolder(fcfg)
+	m.StartFolder(fcfg.ID)
+	m.ServeBackground()
+
+	file := testDataExpected["foo"]
+	files := m.folderFiles["default"]
+	files.Update(device1, []protocol.FileInfo{file})
+	files.Update(device2, []protocol.FileInfo{file})
+
+	avail := m.Availability("default", file.Name, file.Version, file.Blocks[0])
+	if len(avail) != 0 {
+		t.Errorf("should not be available, no connections")
+	}
+
+	addFakeConn(m, device1)
+	addFakeConn(m, device2)
+
+	// !!! This is not what I'd expect to happen, as we don't even know if the peer has the original index !!!
+
+	avail = m.Availability("default", file.Name, file.Version, file.Blocks[0])
+	if len(avail) != 2 {
+		t.Errorf("should have two available")
+	}
+
+	cc := protocol.ClusterConfig{
+		Folders: []protocol.Folder{
+			{
+				ID: "default",
+				Devices: []protocol.Device{
+					{ID: device1},
+					{ID: device2},
+				},
+			},
+		},
+	}
+
+	m.ClusterConfig(device1, cc)
+	m.ClusterConfig(device2, cc)
+
+	avail = m.Availability("default", file.Name, file.Version, file.Blocks[0])
+	if len(avail) != 2 {
+		t.Errorf("should have two available")
+	}
+
+	m.Closed(&fakeConnection{id: device1}, errDeviceUnknown)
+	m.Closed(&fakeConnection{id: device2}, errDeviceUnknown)
+
+	avail = m.Availability("default", file.Name, file.Version, file.Blocks[0])
+	if len(avail) != 0 {
+		t.Errorf("should have no available")
+	}
+
+	// Test that remote paused folders are not used.
+
+	addFakeConn(m, device1)
+	addFakeConn(m, device2)
+
+	m.ClusterConfig(device1, cc)
+	ccp := cc
+	ccp.Folders[0].Paused = true
+	m.ClusterConfig(device1, ccp)
+
+	avail = m.Availability("default", file.Name, file.Version, file.Blocks[0])
+	if len(avail) != 1 {
+		t.Errorf("should have one available")
+	}
+}
+
+func TestRootedJoinedPath(t *testing.T) {
+	type testcase struct {
+		root   string
+		rel    string
+		joined string
+		ok     bool
+	}
+	cases := []testcase{
+		// Valid cases
+		{"foo", "bar", "foo/bar", true},
+		{"foo", "/bar", "foo/bar", true},
+		{"foo/", "bar", "foo/bar", true},
+		{"foo/", "/bar", "foo/bar", true},
+		{"baz/foo", "bar", "baz/foo/bar", true},
+		{"baz/foo", "/bar", "baz/foo/bar", true},
+		{"baz/foo/", "bar", "baz/foo/bar", true},
+		{"baz/foo/", "/bar", "baz/foo/bar", true},
+		{"foo", "bar/baz", "foo/bar/baz", true},
+		{"foo", "/bar/baz", "foo/bar/baz", true},
+		{"foo/", "bar/baz", "foo/bar/baz", true},
+		{"foo/", "/bar/baz", "foo/bar/baz", true},
+		{"baz/foo", "bar/baz", "baz/foo/bar/baz", true},
+		{"baz/foo", "/bar/baz", "baz/foo/bar/baz", true},
+		{"baz/foo/", "bar/baz", "baz/foo/bar/baz", true},
+		{"baz/foo/", "/bar/baz", "baz/foo/bar/baz", true},
+
+		// Not escape attempts, but oddly formatted relative paths. Disallowed.
+		{"foo", "./bar", "", false},
+		{"baz/foo", "./bar", "", false},
+		{"foo", "./bar/baz", "", false},
+		{"baz/foo", "./bar/baz", "", false},
+		{"baz/foo", "bar/../baz", "", false},
+		{"baz/foo", "/bar/../baz", "", false},
+		{"baz/foo", "./bar/../baz", "", false},
+		{"baz/foo", "bar/../baz", "", false},
+		{"baz/foo", "/bar/../baz", "", false},
+		{"baz/foo", "./bar/../baz", "", false},
+
+		// Results in an allowed path, but does it by probing. Disallowed.
+		{"foo", "../foo", "", false},
+		{"foo", "../foo/bar", "", false},
+		{"baz/foo", "../foo/bar", "", false},
+		{"baz/foo", "../../baz/foo/bar", "", false},
+		{"baz/foo", "bar/../../foo/bar", "", false},
+		{"baz/foo", "bar/../../../baz/foo/bar", "", false},
+
+		// Escape attempts.
+		{"foo", "", "", false},
+		{"foo", "/", "", false},
+		{"foo", "..", "", false},
+		{"foo", "/..", "", false},
+		{"foo", "../", "", false},
+		{"foo", "../bar", "", false},
+		{"foo", "../foobar", "", false},
+		{"foo/", "../bar", "", false},
+		{"foo/", "../foobar", "", false},
+		{"baz/foo", "../bar", "", false},
+		{"baz/foo", "../foobar", "", false},
+		{"baz/foo/", "../bar", "", false},
+		{"baz/foo/", "../foobar", "", false},
+		{"baz/foo/", "bar/../../quux/baz", "", false},
+
+		// Empty root is a misconfiguration.
+		{"", "/foo", "", false},
+		{"", "foo", "", false},
+		{"", ".", "", false},
+		{"", "..", "", false},
+		{"", "/", "", false},
+		{"", "", "", false},
+
+		// Root=/ is valid, and things should be verified as usual.
+		{"/", "foo", "/foo", true},
+		{"/", "/foo", "/foo", true},
+		{"/", "../foo", "", false},
+		{"/", ".", "", false},
+		{"/", "..", "", false},
+		{"/", "/", "", false},
+		{"/", "", "", false},
+	}
+
+	if runtime.GOOS == "windows" {
+		extraCases := []testcase{
+			{`c:\`, `foo`, `c:\foo`, true},
+			{`\\?\c:\`, `foo`, `\\?\c:\foo`, true},
+			{`c:\`, `\foo`, `c:\foo`, true},
+			{`\\?\c:\`, `\foo`, `\\?\c:\foo`, true},
+
+			{`c:\`, `\\foo`, ``, false},
+			{`c:\`, ``, ``, false},
+			{`c:\`, `.`, ``, false},
+			{`c:\`, `\`, ``, false},
+			{`\\?\c:\`, `\\foo`, ``, false},
+			{`\\?\c:\`, ``, ``, false},
+			{`\\?\c:\`, `.`, ``, false},
+			{`\\?\c:\`, `\`, ``, false},
+
+			// makes no sense, but will be treated simply as a bad filename
+			{`c:\foo`, `d:\bar`, `c:\foo\d:\bar`, true},
+		}
+
+		for _, tc := range cases {
+			// Add case where root is backslashed, rel is forward slashed
+			extraCases = append(extraCases, testcase{
+				root:   filepath.FromSlash(tc.root),
+				rel:    tc.rel,
+				joined: tc.joined,
+				ok:     tc.ok,
+			})
+			// and the opposite
+			extraCases = append(extraCases, testcase{
+				root:   tc.root,
+				rel:    filepath.FromSlash(tc.rel),
+				joined: tc.joined,
+				ok:     tc.ok,
+			})
+			// and both backslashed
+			extraCases = append(extraCases, testcase{
+				root:   filepath.FromSlash(tc.root),
+				rel:    filepath.FromSlash(tc.rel),
+				joined: tc.joined,
+				ok:     tc.ok,
+			})
+		}
+
+		cases = append(cases, extraCases...)
+	}
+
+	for _, tc := range cases {
+		res, err := rootedJoinedPath(tc.root, tc.rel)
+		if tc.ok {
+			if err != nil {
+				t.Errorf("Unexpected error for rootedJoinedPath(%q, %q): %v", tc.root, tc.rel, err)
+				continue
+			}
+			exp := filepath.FromSlash(tc.joined)
+			if res != exp {
+				t.Errorf("Unexpected result for rootedJoinedPath(%q, %q): %q != expected %q", tc.root, tc.rel, res, exp)
+			}
+		} else if err == nil {
+			t.Errorf("Unexpected pass for rootedJoinedPath(%q, %q) => %q", tc.root, tc.rel, res)
+			continue
+		}
+	}
+}
+
+func addFakeConn(m *Model, dev protocol.DeviceID) *fakeConnection {
+	fc := &fakeConnection{id: dev, model: m}
+	m.AddConnection(fc, protocol.HelloResult{})
+
+	m.ClusterConfig(dev, protocol.ClusterConfig{
+		Folders: []protocol.Folder{
+			{
+				ID: "default",
+				Devices: []protocol.Device{
+					{ID: device1},
+					{ID: device2},
+				},
+			},
+		},
+	})
+
+	return fc
+}
+
 type fakeAddr struct{}
 
 func (fakeAddr) Network() string {
@@ -1527,38 +2463,4 @@ func (fakeAddr) Network() string {
 
 func (fakeAddr) String() string {
 	return "address"
-}
-
-type fakeConn struct{}
-
-func (fakeConn) Close() error {
-	return nil
-}
-
-func (fakeConn) LocalAddr() net.Addr {
-	return &fakeAddr{}
-}
-
-func (fakeConn) RemoteAddr() net.Addr {
-	return &fakeAddr{}
-}
-
-func (fakeConn) Read([]byte) (int, error) {
-	return 0, nil
-}
-
-func (fakeConn) Write([]byte) (int, error) {
-	return 0, nil
-}
-
-func (fakeConn) SetDeadline(time.Time) error {
-	return nil
-}
-
-func (fakeConn) SetReadDeadline(time.Time) error {
-	return nil
-}
-
-func (fakeConn) SetWriteDeadline(time.Time) error {
-	return nil
 }

@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -66,7 +66,7 @@ func generateFiles(dir string, files, maxexp int, srcname string) error {
 }
 
 func generateOneFile(fd io.ReadSeeker, p1 string, s int64) error {
-	src := io.LimitReader(&inifiteReader{fd}, int64(s))
+	src := io.LimitReader(&inifiteReader{fd}, s)
 	dst, err := os.Create(p1)
 	if err != nil {
 		return err
@@ -85,12 +85,7 @@ func generateOneFile(fd io.ReadSeeker, p1 string, s int64) error {
 	_ = os.Chmod(p1, os.FileMode(rand.Intn(0777)|0400))
 
 	t := time.Now().Add(-time.Duration(rand.Intn(30*86400)) * time.Second)
-	err = os.Chtimes(p1, t, t)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return os.Chtimes(p1, t, t)
 }
 
 func randomName() string {

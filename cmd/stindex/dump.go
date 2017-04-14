@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"time"
 
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -53,7 +54,13 @@ func dump(ldb *db.Instance) {
 			fmt.Printf("[fstat] K:%x V:%x\n", it.Key(), it.Value())
 
 		case db.KeyTypeVirtualMtime:
-			fmt.Printf("[mtime] K:%x V:%x\n", it.Key(), it.Value())
+			folder := binary.BigEndian.Uint32(key[1:])
+			name := nulString(key[1+4:])
+			val := it.Value()
+			var real, virt time.Time
+			real.UnmarshalBinary(val[:len(val)/2])
+			virt.UnmarshalBinary(val[len(val)/2:])
+			fmt.Printf("[mtime] F:%d N:%q R:%v V:%v\n", folder, name, real, virt)
 
 		case db.KeyTypeFolderIdx:
 			key := binary.BigEndian.Uint32(it.Key()[1:])

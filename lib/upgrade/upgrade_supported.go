@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // +build !noupgrade
 
@@ -84,10 +84,10 @@ func insecureGet(url, version string) (*http.Response, error) {
 	return insecureHTTP.Do(req)
 }
 
-// FetchLatestReleases returns the latest releases, including prereleases or
-// not depending on the argument
-func FetchLatestReleases(releasesURL, version string) []Release {
-	resp, err := insecureGet(releasesURL, version)
+// FetchLatestReleases returns the latest releases. The "current" parameter
+// is used for setting the User-Agent only.
+func FetchLatestReleases(releasesURL, current string) []Release {
+	resp, err := insecureGet(releasesURL, current)
 	if err != nil {
 		l.Infoln("Couldn't fetch release information:", err)
 		return nil
@@ -119,24 +119,22 @@ func (s SortByRelease) Less(i, j int) bool {
 	return CompareVersions(s[i].Tag, s[j].Tag) > 0
 }
 
-func LatestRelease(releasesURL, version string) (Release, error) {
-	rels := FetchLatestReleases(releasesURL, version)
-	return SelectLatestRelease(version, rels)
+func LatestRelease(releasesURL, current string, upgradeToPreReleases bool) (Release, error) {
+	rels := FetchLatestReleases(releasesURL, current)
+	return SelectLatestRelease(rels, current, upgradeToPreReleases)
 }
 
-func SelectLatestRelease(version string, rels []Release) (Release, error) {
+func SelectLatestRelease(rels []Release, current string, upgradeToPreReleases bool) (Release, error) {
 	if len(rels) == 0 {
 		return Release{}, ErrNoVersionToSelect
 	}
 
 	// Sort the releases, lowest version number first
 	sort.Sort(sort.Reverse(SortByRelease(rels)))
-	// Check for a beta build
-	beta := strings.Contains(version, "-")
 
 	var selected Release
 	for _, rel := range rels {
-		switch CompareVersions(rel.Tag, version) {
+		switch CompareVersions(rel.Tag, current) {
 		case Older, MajorOlder:
 			// This is older than what we're already running
 			continue
@@ -145,7 +143,7 @@ func SelectLatestRelease(version string, rels []Release) (Release, error) {
 			// We've found a new major version. That's fine, but if we've
 			// already found a minor upgrade that is acceptable we should go
 			// with that one first and then revisit in the future.
-			if selected.Tag != "" && CompareVersions(selected.Tag, version) == Newer {
+			if selected.Tag != "" && CompareVersions(selected.Tag, current) == Newer {
 				return selected, nil
 			}
 			// else it may be viable, do the needful below
@@ -154,7 +152,7 @@ func SelectLatestRelease(version string, rels []Release) (Release, error) {
 			// New minor release, do the usual processing
 		}
 
-		if rel.Prerelease && !beta {
+		if rel.Prerelease && !upgradeToPreReleases {
 			continue
 		}
 		for _, asset := range rel.Assets {
@@ -198,6 +196,7 @@ func upgradeToURL(archiveName, binary string, url string) error {
 	if err != nil {
 		return err
 	}
+	defer os.Remove(fname)
 
 	old := binary + ".old"
 	os.Remove(old)
@@ -205,7 +204,11 @@ func upgradeToURL(archiveName, binary string, url string) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(fname, binary)
+	if os.Rename(fname, binary); err != nil {
+		os.Rename(old, binary)
+		return err
+	}
+	return nil
 }
 
 func readRelease(archiveName, dir, url string) (string, error) {
@@ -388,7 +391,7 @@ func verifyUpgrade(archiveName, tempName string, sig []byte) error {
 	//
 	// We then verify the release signature against the contents of this
 	// multireader. This ensures that it is not only a bonafide syncthing
-	// binary, but it it also of exactly the platform and version we expect.
+	// binary, but it is also of exactly the platform and version we expect.
 
 	mr := io.MultiReader(bytes.NewBufferString(archiveName+"\n"), fd)
 	err = signature.Verify(SigningKey, sig, mr)

@@ -1,5 +1,3 @@
-// protoc --proto_path=../../../../../:../../../../gogo/protobuf/protobuf:. --gogofast_out=. message.proto
-
 syntax = "proto3";
 
 package protocol;
@@ -58,18 +56,21 @@ message Folder {
     bool   ignore_permissions   = 4;
     bool   ignore_delete        = 5;
     bool   disable_temp_indexes = 6;
+    bool   paused               = 7;
 
     repeated Device devices = 16 [(gogoproto.nullable) = false];
 }
 
 message Device {
-    bytes           id                = 1 [(gogoproto.customname) = "ID"];
-    string          name              = 2;
-    repeated string addresses         = 3;
-    Compression     compression       = 4;
-    string          cert_name         = 5;
-    int64           max_local_version = 6;
-    bool            introducer        = 7;
+    bytes           id                         = 1 [(gogoproto.customname) = "ID", (gogoproto.customtype) = "DeviceID", (gogoproto.nullable) = false];
+    string          name                       = 2;
+    repeated string addresses                  = 3;
+    Compression     compression                = 4;
+    string          cert_name                  = 5;
+    int64           max_sequence               = 6;
+    bool            introducer                 = 7;
+    uint64          index_id                   = 8 [(gogoproto.customname) = "IndexID", (gogoproto.customtype) = "IndexID", (gogoproto.nullable) = false];
+    bool            skip_introduction_removals = 9;
 }
 
 enum Compression {
@@ -96,29 +97,33 @@ message FileInfo {
     FileInfoType type           = 2;
     int64        size           = 3;
     uint32       permissions    = 4;
-    int64        modified       = 5;
+    int64        modified_s     = 5;
+    int32        modified_ns    = 11;
+    uint64       modified_by    = 12 [(gogoproto.customtype) = "ShortID", (gogoproto.nullable) = false];
     bool         deleted        = 6;
     bool         invalid        = 7;
     bool         no_permissions = 8;
     Vector       version        = 9 [(gogoproto.nullable) = false];
-    int64        local_version  = 10;
+    int64        sequence       = 10;
 
-    repeated BlockInfo Blocks = 16 [(gogoproto.nullable) = false];
+    repeated BlockInfo Blocks         = 16 [(gogoproto.nullable) = false];
+    string             symlink_target = 17;
 }
 
 enum FileInfoType {
     FILE              = 0 [(gogoproto.enumvalue_customname) = "FileInfoTypeFile"];
     DIRECTORY         = 1 [(gogoproto.enumvalue_customname) = "FileInfoTypeDirectory"];
-    SYMLINK_FILE      = 2 [(gogoproto.enumvalue_customname) = "FileInfoTypeSymlinkFile"];
-    SYMLINK_DIRECTORY = 3 [(gogoproto.enumvalue_customname) = "FileInfoTypeSymlinkDirectory"];
-    SYMLINK_UNKNOWN   = 4 [(gogoproto.enumvalue_customname) = "FileInfoTypeSymlinkUnknown"];
+    SYMLINK_FILE      = 2 [(gogoproto.enumvalue_customname) = "FileInfoTypeDeprecatedSymlinkFile", deprecated = true];
+    SYMLINK_DIRECTORY = 3 [(gogoproto.enumvalue_customname) = "FileInfoTypeDeprecatedSymlinkDirectory", deprecated = true];
+    SYMLINK           = 4 [(gogoproto.enumvalue_customname) = "FileInfoTypeSymlink"];
 }
 
 message BlockInfo {
     option (gogoproto.goproto_stringer) = false;
-    int64 offset = 1;
-    int32 size   = 2;
-    bytes hash   = 3;
+    int64  offset    = 1;
+    int32  size      = 2;
+    bytes  hash      = 3;
+    uint32 weak_hash = 4;
 }
 
 message Vector {
@@ -168,7 +173,7 @@ message FileDownloadProgressUpdate {
     FileDownloadProgressUpdateType update_type   = 1;
     string                         name          = 2;
     Vector                         version       = 3 [(gogoproto.nullable) = false];
-    repeated int32                 block_indexes = 4;
+    repeated int32                 block_indexes = 4 [packed=false];
 }
 
 enum FileDownloadProgressUpdateType {

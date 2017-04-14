@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Package osutil implements utilities for native OS support.
 package osutil
@@ -15,13 +15,12 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 
 	"github.com/calmh/du"
 	"github.com/syncthing/syncthing/lib/sync"
 )
 
-var ErrNoHome = errors.New("No home directory found - set $HOME (or the platform equivalent).")
+var errNoHome = errors.New("no home directory found - set $HOME (or the platform equivalent)")
 
 // Try to keep this entire operation atomic-like. We shouldn't be doing this
 // often enough that there is any contention on this lock.
@@ -93,93 +92,6 @@ func InWritableDir(fn func(string) error, path string) error {
 	return fn(path)
 }
 
-// Remove removes the given path. On Windows, removes the read-only attribute
-// from the target prior to deletion.
-func Remove(path string) error {
-	if runtime.GOOS == "windows" {
-		info, err := os.Stat(path)
-		if err != nil {
-			return err
-		}
-		if info.Mode()&0200 == 0 {
-			os.Chmod(path, 0700)
-		}
-	}
-	return os.Remove(path)
-}
-
-// RemoveAll is a copy of os.RemoveAll, but uses osutil.Remove.
-// RemoveAll removes path and any children it contains.
-// It removes everything it can but returns the first error
-// it encounters.  If the path does not exist, RemoveAll
-// returns nil (no error).
-func RemoveAll(path string) error {
-	// Simple case: if Remove works, we're done.
-	err := Remove(path)
-	if err == nil || os.IsNotExist(err) {
-		return nil
-	}
-
-	// Otherwise, is this a directory we need to recurse into?
-	dir, serr := os.Lstat(path)
-	if serr != nil {
-		if serr, ok := serr.(*os.PathError); ok && (os.IsNotExist(serr.Err) || serr.Err == syscall.ENOTDIR) {
-			return nil
-		}
-		return serr
-	}
-	if !dir.IsDir() {
-		// Not a directory; return the error from Remove.
-		return err
-	}
-
-	// Directory.
-	fd, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Race. It was deleted between the Lstat and Open.
-			// Return nil per RemoveAll's docs.
-			return nil
-		}
-		return err
-	}
-
-	// Remove contents & return first error.
-	err = nil
-	for {
-		names, err1 := fd.Readdirnames(100)
-		for _, name := range names {
-			err1 := RemoveAll(path + string(os.PathSeparator) + name)
-			if err == nil {
-				err = err1
-			}
-		}
-		if err1 == io.EOF {
-			break
-		}
-		// If Readdirnames returned an error, use it.
-		if err == nil {
-			err = err1
-		}
-		if len(names) == 0 {
-			break
-		}
-	}
-
-	// Close directory, because windows won't remove opened directory.
-	fd.Close()
-
-	// Remove directory.
-	err1 := Remove(path)
-	if err1 == nil || os.IsNotExist(err1) {
-		return nil
-	}
-	if err == nil {
-		err = err1
-	}
-	return err
-}
-
 func ExpandTilde(path string) (string, error) {
 	if path == "~" {
 		return getHomeDir()
@@ -211,7 +123,7 @@ func getHomeDir() (string, error) {
 	}
 
 	if home == "" {
-		return "", ErrNoHome
+		return "", errNoHome
 	}
 
 	return home, nil
@@ -260,10 +172,7 @@ func copyFileContents(src, dst string) (err error) {
 			err = cerr
 		}
 	}()
-	if _, err = io.Copy(out, in); err != nil {
-		return
-	}
-	err = out.Sync()
+	_, err = io.Copy(out, in)
 	return
 }
 

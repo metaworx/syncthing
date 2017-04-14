@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -69,7 +70,7 @@ func TestStopAfterBrokenConfig(t *testing.T) {
 	}
 	w := config.Wrap("/dev/null", cfg)
 
-	srv := newAPIService(protocol.LocalDeviceID, w, "../../test/h1/https-cert.pem", "../../test/h1/https-key.pem", "", nil, nil, nil, nil, nil, nil)
+	srv := newAPIService(protocol.LocalDeviceID, w, "../../test/h1/https-cert.pem", "../../test/h1/https-key.pem", "", nil, nil, nil, nil, nil, nil, nil)
 	srv.started = make(chan string)
 
 	sup := suture.NewSimple("test")
@@ -460,7 +461,6 @@ func TestHTTPLogin(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("Unexpected non-200 return code %d for authed request (ISO-8859-1)", resp.StatusCode)
 	}
-
 }
 
 func startHTTP(cfg *mockedConfig) (string, error) {
@@ -469,6 +469,7 @@ func startHTTP(cfg *mockedConfig) (string, error) {
 	httpsKeyFile := "../../test/h1/https-key.pem"
 	assetDir := "../../gui"
 	eventSub := new(mockedEventSub)
+	diskEventSub := new(mockedEventSub)
 	discoverer := new(mockedCachingMux)
 	connections := new(mockedConnections)
 	errorLog := new(mockedLoggerRecorder)
@@ -477,7 +478,7 @@ func startHTTP(cfg *mockedConfig) (string, error) {
 
 	// Instantiate the API service
 	svc := newAPIService(protocol.LocalDeviceID, cfg, httpsCertFile, httpsKeyFile, assetDir, model,
-		eventSub, discoverer, connections, errorLog, systemLog)
+		eventSub, diskEventSub, discoverer, connections, errorLog, systemLog)
 	svc.started = addrChan
 
 	// Actually start the API service
@@ -491,7 +492,12 @@ func startHTTP(cfg *mockedConfig) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("Weird address from API service: %v", err)
 	}
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", tcpAddr.Port)
+
+	host, _, _ := net.SplitHostPort(cfg.gui.RawAddress)
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	}
+	baseURL := fmt.Sprintf("http://%s", net.JoinHostPort(host, strconv.Itoa(tcpAddr.Port)))
 
 	return baseURL, nil
 }
@@ -501,6 +507,9 @@ func TestCSRFRequired(t *testing.T) {
 	cfg := new(mockedConfig)
 	cfg.gui.APIKey = testAPIKey
 	baseURL, err := startHTTP(cfg)
+	if err != nil {
+		t.Fatal("Unexpected error from getting base URL:", err)
+	}
 
 	cli := &http.Client{
 		Timeout: time.Second,
@@ -665,4 +674,253 @@ func testConfigPost(data io.Reader) (*http.Response, error) {
 	req, _ := http.NewRequest("POST", baseURL+"/rest/system/config", data)
 	req.Header.Set("X-API-Key", testAPIKey)
 	return cli.Do(req)
+}
+
+func TestHostCheck(t *testing.T) {
+	// An API service bound to localhost should reject non-localhost host Headers
+
+	cfg := new(mockedConfig)
+	cfg.gui.RawAddress = "127.0.0.1:0"
+	baseURL, err := startHTTP(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A normal HTTP get to the localhost-bound service should succeed
+
+	resp, err := http.Get(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Regular HTTP get: expected 200 OK, not", resp.Status)
+	}
+
+	// A request with a suspicious Host header should fail
+
+	req, _ := http.NewRequest("GET", baseURL, nil)
+	req.Host = "example.com"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Error("Suspicious Host header: expected 403 Forbidden, not", resp.Status)
+	}
+
+	// A request with an explicit "localhost:8384" Host header should pass
+
+	req, _ = http.NewRequest("GET", baseURL, nil)
+	req.Host = "localhost:8384"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Explicit localhost:8384: expected 200 OK, not", resp.Status)
+	}
+
+	// A request with an explicit "localhost" Host header (no port) should pass
+
+	req, _ = http.NewRequest("GET", baseURL, nil)
+	req.Host = "localhost"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Explicit localhost: expected 200 OK, not", resp.Status)
+	}
+
+	// A server with InsecureSkipHostCheck set behaves differently
+
+	cfg = new(mockedConfig)
+	cfg.gui.RawAddress = "127.0.0.1:0"
+	cfg.gui.InsecureSkipHostCheck = true
+	baseURL, err = startHTTP(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A request with a suspicious Host header should be allowed
+
+	req, _ = http.NewRequest("GET", baseURL, nil)
+	req.Host = "example.com"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Incorrect host header, check disabled: expected 200 OK, not", resp.Status)
+	}
+
+	// A server bound to a wildcard address also doesn't do the check
+
+	cfg = new(mockedConfig)
+	cfg.gui.RawAddress = "0.0.0.0:0"
+	cfg.gui.InsecureSkipHostCheck = true
+	baseURL, err = startHTTP(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A request with a suspicious Host header should be allowed
+
+	req, _ = http.NewRequest("GET", baseURL, nil)
+	req.Host = "example.com"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Incorrect host header, wildcard bound: expected 200 OK, not", resp.Status)
+	}
+
+	// This should all work over IPv6 as well
+
+	cfg = new(mockedConfig)
+	cfg.gui.RawAddress = "[::1]:0"
+	baseURL, err = startHTTP(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A normal HTTP get to the localhost-bound service should succeed
+
+	resp, err = http.Get(baseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Regular HTTP get (IPv6): expected 200 OK, not", resp.Status)
+	}
+
+	// A request with a suspicious Host header should fail
+
+	req, _ = http.NewRequest("GET", baseURL, nil)
+	req.Host = "example.com"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Error("Suspicious Host header (IPv6): expected 403 Forbidden, not", resp.Status)
+	}
+
+	// A request with an explicit "localhost:8384" Host header should pass
+
+	req, _ = http.NewRequest("GET", baseURL, nil)
+	req.Host = "localhost:8384"
+	resp, err = http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("Explicit localhost:8384 (IPv6): expected 200 OK, not", resp.Status)
+	}
+}
+
+func TestAddressIsLocalhost(t *testing.T) {
+	testcases := []struct {
+		address string
+		result  bool
+	}{
+		// These are all valid localhost addresses
+		{"localhost", true},
+		{"LOCALHOST", true},
+		{"::1", true},
+		{"127.0.0.1", true},
+		{"localhost:8080", true},
+		{"LOCALHOST:8000", true},
+		{"[::1]:8080", true},
+		{"127.0.0.1:8080", true},
+
+		// These are all non-localhost addresses
+		{"example.com", false},
+		{"example.com:8080", false},
+		{"192.0.2.10", false},
+		{"192.0.2.10:8080", false},
+		{"0.0.0.0", false},
+		{"0.0.0.0:8080", false},
+		{"::", false},
+		{"[::]:8080", false},
+		{":8080", false},
+	}
+
+	for _, tc := range testcases {
+		result := addressIsLocalhost(tc.address)
+		if result != tc.result {
+			t.Errorf("addressIsLocalhost(%q)=%v, expected %v", tc.address, result, tc.result)
+		}
+	}
+}
+
+func TestAccessControlAllowOriginHeader(t *testing.T) {
+	const testAPIKey = "foobarbaz"
+	cfg := new(mockedConfig)
+	cfg.gui.APIKey = testAPIKey
+	baseURL, err := startHTTP(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &http.Client{
+		Timeout: time.Second,
+	}
+
+	req, _ := http.NewRequest("GET", baseURL+"/rest/system/status", nil)
+	req.Header.Set("X-API-Key", testAPIKey)
+	resp, err := cli.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatal("GET on /rest/system/status should succeed, not", resp.Status)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatal("GET on /rest/system/status should return a 'Access-Control-Allow-Origin: *' header")
+	}
+}
+
+func TestOptionsRequest(t *testing.T) {
+	const testAPIKey = "foobarbaz"
+	cfg := new(mockedConfig)
+	cfg.gui.APIKey = testAPIKey
+	baseURL, err := startHTTP(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cli := &http.Client{
+		Timeout: time.Second,
+	}
+
+	req, _ := http.NewRequest("OPTIONS", baseURL+"/rest/system/status", nil)
+	resp, err := cli.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatal("OPTIONS on /rest/system/status should succeed, not", resp.Status)
+	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatal("OPTIONS on /rest/system/status should return a 'Access-Control-Allow-Origin: *' header")
+	}
+	if resp.Header.Get("Access-Control-Allow-Methods") != "GET, POST" {
+		t.Fatal("OPTIONS on /rest/system/status should return a 'Access-Control-Allow-Methods: GET, POST' header")
+	}
+	if resp.Header.Get("Access-Control-Allow-Headers") != "Content-Type, X-API-Key" {
+		t.Fatal("OPTIONS on /rest/system/status should return a 'Access-Control-Allow-Headers: Content-Type, X-API-KEY' header")
+	}
 }

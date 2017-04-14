@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package db
 
@@ -45,12 +45,20 @@ func TestGlobalKey(t *testing.T) {
 
 	key := db.globalKey(fld, name)
 
-	fld2 := db.globalKeyFolder(key)
+	fld2, ok := db.globalKeyFolder(key)
+	if !ok {
+		t.Error("should have been found")
+	}
 	if !bytes.Equal(fld2, fld) {
 		t.Errorf("wrong folder %q != %q", fld2, fld)
 	}
 	name2 := db.globalKeyName(key)
 	if !bytes.Equal(name2, name) {
 		t.Errorf("wrong name %q != %q", name2, name)
+	}
+
+	_, ok = db.globalKeyFolder([]byte{1, 2, 3, 4, 5})
+	if ok {
+		t.Error("should not have been found")
 	}
 }

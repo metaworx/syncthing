@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connections
 
@@ -10,12 +10,10 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/url"
 	"time"
 
-	"github.com/juju/ratelimit"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/discover"
 	"github.com/syncthing/syncthing/lib/events"
@@ -29,6 +27,7 @@ import (
 	_ "github.com/syncthing/syncthing/lib/upnp"
 
 	"github.com/thejerf/suture"
+	"golang.org/x/time/rate"
 )
 
 var (
@@ -37,9 +36,35 @@ var (
 )
 
 const (
-	perDeviceWarningRate = 1.0 / (15 * 60) // Once per 15 minutes
+	perDeviceWarningIntv = 15 * time.Minute
 	tlsHandshakeTimeout  = 10 * time.Second
 )
+
+// From go/src/crypto/tls/cipher_suites.go
+var tlsCipherSuiteNames = map[uint16]string{
+	0x0005: "TLS_RSA_WITH_RC4_128_SHA",
+	0x000a: "TLS_RSA_WITH_3DES_EDE_CBC_SHA",
+	0x002f: "TLS_RSA_WITH_AES_128_CBC_SHA",
+	0x0035: "TLS_RSA_WITH_AES_256_CBC_SHA",
+	0x003c: "TLS_RSA_WITH_AES_128_CBC_SHA256",
+	0x009c: "TLS_RSA_WITH_AES_128_GCM_SHA256",
+	0x009d: "TLS_RSA_WITH_AES_256_GCM_SHA384",
+	0xc007: "TLS_ECDHE_ECDSA_WITH_RC4_128_SHA",
+	0xc009: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+	0xc00a: "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+	0xc011: "TLS_ECDHE_RSA_WITH_RC4_128_SHA",
+	0xc012: "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+	0xc013: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+	0xc014: "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+	0xc023: "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
+	0xc027: "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+	0xc02f: "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+	0xc02b: "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+	0xc030: "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+	0xc02c: "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+	0xcca8: "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305",
+	0xcca9: "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305",
+}
 
 // Service listens and dials all configured unconnected devices, via supported
 // dialers. Successful connections are handed to the model.
@@ -50,69 +75,76 @@ type Service struct {
 	model                Model
 	tlsCfg               *tls.Config
 	discoverer           discover.Finder
-	conns                chan IntermediateConnection
+	conns                chan internalConn
 	bepProtocolName      string
 	tlsDefaultCommonName string
 	lans                 []*net.IPNet
-	writeRateLimit       *ratelimit.Bucket
-	readRateLimit        *ratelimit.Bucket
+	limiter              *limiter
 	natService           *nat.Service
 	natServiceToken      *suture.ServiceToken
 
-	listenersMut   sync.RWMutex
-	listeners      map[string]genericListener
-	listenerTokens map[string]suture.ServiceToken
+	listenersMut       sync.RWMutex
+	listeners          map[string]genericListener
+	listenerTokens     map[string]suture.ServiceToken
+	listenerSupervisor *suture.Supervisor
 
 	curConMut         sync.Mutex
-	currentConnection map[protocol.DeviceID]Connection
+	currentConnection map[protocol.DeviceID]completeConn
 }
 
 func NewService(cfg *config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder,
 	bepProtocolName string, tlsDefaultCommonName string, lans []*net.IPNet) *Service {
 
 	service := &Service{
-		Supervisor:           suture.NewSimple("connections.Service"),
+		Supervisor: suture.New("connections.Service", suture.Spec{
+			Log: func(line string) {
+				l.Infoln(line)
+			},
+		}),
 		cfg:                  cfg,
 		myID:                 myID,
 		model:                mdl,
 		tlsCfg:               tlsCfg,
 		discoverer:           discoverer,
-		conns:                make(chan IntermediateConnection),
+		conns:                make(chan internalConn),
 		bepProtocolName:      bepProtocolName,
 		tlsDefaultCommonName: tlsDefaultCommonName,
 		lans:                 lans,
+		limiter:              newLimiter(cfg),
 		natService:           nat.NewService(myID, cfg),
 
 		listenersMut:   sync.NewRWMutex(),
 		listeners:      make(map[string]genericListener),
 		listenerTokens: make(map[string]suture.ServiceToken),
 
+		// A listener can fail twice, rapidly. Any more than that and it
+		// will be put on suspension for ten minutes. Restarts and changes
+		// due to config are done by removing and adding services, so are
+		// not subject to these limitations.
+		listenerSupervisor: suture.New("c.S.listenerSupervisor", suture.Spec{
+			Log: func(line string) {
+				l.Infoln(line)
+			},
+			FailureThreshold: 2,
+			FailureBackoff:   600 * time.Second,
+		}),
+
 		curConMut:         sync.NewMutex(),
-		currentConnection: make(map[protocol.DeviceID]Connection),
+		currentConnection: make(map[protocol.DeviceID]completeConn),
 	}
 	cfg.Subscribe(service)
-
-	// The rate variables are in KiB/s in the UI (despite the camel casing
-	// of the name). We multiply by 1024 here to get B/s.
-	options := service.cfg.Options()
-	if options.MaxSendKbps > 0 {
-		service.writeRateLimit = ratelimit.NewBucketWithRate(float64(1024*options.MaxSendKbps), int64(5*1024*options.MaxSendKbps))
-	}
-
-	if options.MaxRecvKbps > 0 {
-		service.readRateLimit = ratelimit.NewBucketWithRate(float64(1024*options.MaxRecvKbps), int64(5*1024*options.MaxRecvKbps))
-	}
 
 	// There are several moving parts here; one routine per listening address
 	// (handled in configuration changing) to handle incoming connections,
 	// one routine to periodically attempt outgoing connections, one routine to
-	// the the common handling regardless of whether the connection was
+	// the common handling regardless of whether the connection was
 	// incoming or outgoing.
 
 	service.Add(serviceFunc(service.connect))
 	service.Add(serviceFunc(service.handle))
+	service.Add(service.listenerSupervisor)
 
-	raw := cfg.Raw()
+	raw := cfg.RawCopy()
 	// Actually starts the listeners and NAT service
 	service.CommitConfiguration(raw, raw)
 
@@ -183,19 +215,26 @@ next:
 		}
 		c.SetDeadline(time.Time{})
 
-		s.model.OnHello(remoteID, c.RemoteAddr(), hello)
+		// The Model will return an error for devices that we don't want to
+		// have a connection with for whatever reason, for example unknown devices.
+		if err := s.model.OnHello(remoteID, c.RemoteAddr(), hello); err != nil {
+			l.Infof("Connection from %s at %s (%s) rejected: %v", remoteID, c.RemoteAddr(), c.Type(), err)
+			c.Close()
+			continue
+		}
 
 		// If we have a relay connection, and the new incoming connection is
 		// not a relay connection, we should drop that, and prefer the this one.
+		connected := s.model.ConnectedTo(remoteID)
 		s.curConMut.Lock()
 		ct, ok := s.currentConnection[remoteID]
 		s.curConMut.Unlock()
+		priorityKnown := ok && connected
 
 		// Lower priority is better, just like nice etc.
-		if ok && ct.Priority > c.Priority {
+		if priorityKnown && ct.internalConn.priority > c.priority {
 			l.Debugln("Switching connections", remoteID)
-			s.model.Close(remoteID, protocol.ErrSwitchingConnections)
-		} else if s.model.ConnectedTo(remoteID) {
+		} else if connected {
 			// We should not already be connected to the other party. TODO: This
 			// could use some better handling. If the old connection is dead but
 			// hasn't timed out yet we may want to drop *that* connection and keep
@@ -205,63 +244,47 @@ next:
 			l.Infof("Connected to already connected device (%s)", remoteID)
 			c.Close()
 			continue
-		} else if s.model.IsPaused(remoteID) {
-			l.Infof("Connection from paused device (%s)", remoteID)
+		}
+
+		deviceCfg, ok := s.cfg.Device(remoteID)
+		if !ok {
+			panic("bug: unknown device should already have been rejected")
+		}
+
+		// Verify the name on the certificate. By default we set it to
+		// "syncthing" when generating, but the user may have replaced
+		// the certificate and used another name.
+		certName := deviceCfg.CertName
+		if certName == "" {
+			certName = s.tlsDefaultCommonName
+		}
+		if err := remoteCert.VerifyHostname(certName); err != nil {
+			// Incorrect certificate name is something the user most
+			// likely wants to know about, since it's an advanced
+			// config. Warn instead of Info.
+			l.Warnf("Bad certificate from %s (%v): %v", remoteID, c.RemoteAddr(), err)
 			c.Close()
-			continue
+			continue next
 		}
 
-		for deviceID, deviceCfg := range s.cfg.Devices() {
-			if deviceID == remoteID {
-				// Verify the name on the certificate. By default we set it to
-				// "syncthing" when generating, but the user may have replaced
-				// the certificate and used another name.
-				certName := deviceCfg.CertName
-				if certName == "" {
-					certName = s.tlsDefaultCommonName
-				}
-				err := remoteCert.VerifyHostname(certName)
-				if err != nil {
-					// Incorrect certificate name is something the user most
-					// likely wants to know about, since it's an advanced
-					// config. Warn instead of Info.
-					l.Warnf("Bad certificate from %s (%v): %v", remoteID, c.RemoteAddr(), err)
-					c.Close()
-					continue next
-				}
+		// Wrap the connection in rate limiters. The limiter itself will
+		// keep up with config changes to the rate and whether or not LAN
+		// connections are limited.
+		isLAN := s.isLAN(c.RemoteAddr())
+		wr := s.limiter.newWriteLimiter(c, isLAN)
+		rd := s.limiter.newReadLimiter(c, isLAN)
 
-				// If rate limiting is set, and based on the address we should
-				// limit the connection, then we wrap it in a limiter.
+		name := fmt.Sprintf("%s-%s (%s)", c.LocalAddr(), c.RemoteAddr(), c.Type())
+		protoConn := protocol.NewConnection(remoteID, rd, wr, s.model, name, deviceCfg.Compression)
+		modelConn := completeConn{c, protoConn}
 
-				limit := s.shouldLimit(c.RemoteAddr())
+		l.Infof("Established secure connection to %s at %s (%s)", remoteID, name, tlsCipherSuiteNames[c.ConnectionState().CipherSuite])
 
-				wr := io.Writer(c)
-				if limit && s.writeRateLimit != nil {
-					wr = NewWriteLimiter(c, s.writeRateLimit)
-				}
-
-				rd := io.Reader(c)
-				if limit && s.readRateLimit != nil {
-					rd = NewReadLimiter(c, s.readRateLimit)
-				}
-
-				name := fmt.Sprintf("%s-%s (%s)", c.LocalAddr(), c.RemoteAddr(), c.Type)
-				protoConn := protocol.NewConnection(remoteID, rd, wr, s.model, name, deviceCfg.Compression)
-				modelConn := Connection{c, protoConn}
-
-				l.Infof("Established secure connection to %s at %s", remoteID, name)
-				l.Debugf("cipher suite: %04X in lan: %t", c.ConnectionState().CipherSuite, !limit)
-
-				s.model.AddConnection(modelConn, hello)
-				s.curConMut.Lock()
-				s.currentConnection[remoteID] = modelConn
-				s.curConMut.Unlock()
-				continue next
-			}
-		}
-
-		l.Infof("Connection from %s (%s) with ignored device ID %s", c.RemoteAddr(), c.Type, remoteID)
-		c.Close()
+		s.model.AddConnection(modelConn, hello)
+		s.curConMut.Lock()
+		s.currentConnection[remoteID] = modelConn
+		s.curConMut.Unlock()
+		continue next
 	}
 }
 
@@ -276,7 +299,7 @@ func (s *Service) connect() {
 	var sleep time.Duration
 
 	for {
-		cfg := s.cfg.Raw()
+		cfg := s.cfg.RawCopy()
 
 		bestDialerPrio := 1<<31 - 1 // worse prio won't build on 32 bit
 		for _, df := range dialers {
@@ -300,17 +323,17 @@ func (s *Service) connect() {
 				continue
 			}
 
-			paused := s.model.IsPaused(deviceID)
-			if paused {
+			if deviceCfg.Paused {
 				continue
 			}
 
 			connected := s.model.ConnectedTo(deviceID)
 			s.curConMut.Lock()
-			ct := s.currentConnection[deviceID]
+			ct, ok := s.currentConnection[deviceID]
 			s.curConMut.Unlock()
+			priorityKnown := ok && connected
 
-			if connected && ct.Priority == bestDialerPrio {
+			if priorityKnown && ct.internalConn.priority == bestDialerPrio {
 				// Things are already as good as they can get.
 				continue
 			}
@@ -358,8 +381,8 @@ func (s *Service) connect() {
 					continue
 				}
 
-				if connected && dialerFactory.Priority() >= ct.Priority {
-					l.Debugf("Not dialing using %s as priority is less than current connection (%d >= %d)", dialerFactory, dialerFactory.Priority(), ct.Priority)
+				if priorityKnown && dialerFactory.Priority() >= ct.internalConn.priority {
+					l.Debugf("Not dialing using %s as priority is less than current connection (%d >= %d)", dialerFactory, dialerFactory.Priority(), ct.internalConn.priority)
 					continue
 				}
 
@@ -371,10 +394,6 @@ func (s *Service) connect() {
 				if err != nil {
 					l.Debugln("dial failed", deviceCfg.DeviceID, uri, err)
 					continue
-				}
-
-				if connected {
-					s.model.Close(deviceID, protocol.ErrSwitchingConnections)
 				}
 
 				s.conns <- conn
@@ -395,21 +414,17 @@ func (s *Service) connect() {
 	}
 }
 
-func (s *Service) shouldLimit(addr net.Addr) bool {
-	if s.cfg.Options().LimitBandwidthInLan {
-		return true
-	}
-
+func (s *Service) isLAN(addr net.Addr) bool {
 	tcpaddr, ok := addr.(*net.TCPAddr)
 	if !ok {
-		return true
+		return false
 	}
 	for _, lan := range s.lans {
 		if lan.Contains(tcpaddr.IP) {
-			return false
+			return true
 		}
 	}
-	return !tcpaddr.IP.IsLoopback()
+	return tcpaddr.IP.IsLoopback()
 }
 
 func (s *Service) createListener(factory listenerFactory, uri *url.URL) bool {
@@ -420,7 +435,7 @@ func (s *Service) createListener(factory listenerFactory, uri *url.URL) bool {
 	listener := factory.New(uri, s.cfg, s.tlsCfg, s.conns, s.natService)
 	listener.OnAddressesChanged(s.logListenAddressesChangedEvent)
 	s.listeners[uri.String()] = listener
-	s.listenerTokens[uri.String()] = s.Add(listener)
+	s.listenerTokens[uri.String()] = s.listenerSupervisor.Add(listener)
 	return true
 }
 
@@ -437,10 +452,6 @@ func (s *Service) VerifyConfiguration(from, to config.Configuration) error {
 }
 
 func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
-	// We require a restart if a device as been removed.
-
-	restart := false
-
 	newDevices := make(map[protocol.DeviceID]bool, len(to.Devices))
 	for _, dev := range to.Devices {
 		newDevices[dev.DeviceID] = true
@@ -448,7 +459,12 @@ func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
 
 	for _, dev := range from.Devices {
 		if !newDevices[dev.DeviceID] {
-			restart = true
+			s.curConMut.Lock()
+			delete(s.currentConnection, dev.DeviceID)
+			s.curConMut.Unlock()
+			warningLimitersMut.Lock()
+			delete(warningLimiters, dev.DeviceID)
+			warningLimitersMut.Unlock()
 		}
 	}
 
@@ -483,7 +499,7 @@ func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
 	for addr, listener := range s.listeners {
 		if _, ok := seen[addr]; !ok || !listener.Factory().Enabled(to) {
 			l.Debugln("Stopping listener", addr)
-			s.Remove(s.listenerTokens[addr])
+			s.listenerSupervisor.Remove(s.listenerTokens[addr])
 			delete(s.listenerTokens, addr)
 			delete(s.listeners, addr)
 		}
@@ -500,7 +516,7 @@ func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
 		s.natServiceToken = nil
 	}
 
-	return !restart
+	return true
 }
 
 func (s *Service) AllAddresses() []string {
@@ -604,7 +620,7 @@ func urlsToStrings(urls []*url.URL) []string {
 	return strings
 }
 
-var warningLimiters = make(map[protocol.DeviceID]*ratelimit.Bucket)
+var warningLimiters = make(map[protocol.DeviceID]*rate.Limiter)
 var warningLimitersMut = sync.NewMutex()
 
 func warningFor(dev protocol.DeviceID, msg string) {
@@ -612,10 +628,10 @@ func warningFor(dev protocol.DeviceID, msg string) {
 	defer warningLimitersMut.Unlock()
 	lim, ok := warningLimiters[dev]
 	if !ok {
-		lim = ratelimit.NewBucketWithRate(perDeviceWarningRate, 1)
+		lim = rate.NewLimiter(rate.Every(perDeviceWarningIntv), 1)
 		warningLimiters[dev] = lim
 	}
-	if lim.TakeAvailable(1) == 1 {
+	if lim.Allow() {
 		l.Warnln(msg)
 	}
 }

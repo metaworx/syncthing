@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //+build windows
 
@@ -34,7 +34,7 @@ func trackCPUUsage() {
 	prevTime := ctime.Nanoseconds()
 	prevUsage := ktime.Nanoseconds() + utime.Nanoseconds() // Always overflows
 
-	for _ = range time.NewTicker(time.Second).C {
+	for range time.NewTicker(time.Second).C {
 		err := syscall.GetProcessTimes(handle, &ctime, &etime, &ktime, &utime)
 		if err != nil {
 			continue

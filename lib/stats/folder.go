@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package stats
 
@@ -45,7 +45,7 @@ func (s *FolderStatisticsReference) GetLastFile() LastFile {
 	if !ok {
 		return LastFile{}
 	}
-	deleted, ok := s.ns.Bool("lastFileDeleted")
+	deleted, _ := s.ns.Bool("lastFileDeleted")
 	return LastFile{
 		At:       at,
 		Filename: file,

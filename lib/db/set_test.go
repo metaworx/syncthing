@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package db_test
 
@@ -100,11 +100,11 @@ func TestGlobalSet(t *testing.T) {
 	m := db.NewFileSet("test", ldb)
 
 	local0 := fileList{
-		protocol.FileInfo{Name: "a", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(1)},
-		protocol.FileInfo{Name: "b", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(2)},
-		protocol.FileInfo{Name: "c", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(3)},
-		protocol.FileInfo{Name: "d", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(4)},
-		protocol.FileInfo{Name: "z", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(8)},
+		protocol.FileInfo{Name: "a", Sequence: 1, Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(1)},
+		protocol.FileInfo{Name: "b", Sequence: 2, Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(2)},
+		protocol.FileInfo{Name: "c", Sequence: 3, Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(3)},
+		protocol.FileInfo{Name: "d", Sequence: 4, Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(4)},
+		protocol.FileInfo{Name: "z", Sequence: 5, Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(8)},
 	}
 	local1 := fileList{
 		protocol.FileInfo{Name: "a", Version: protocol.Vector{Counters: []protocol.Counter{{ID: myID, Value: 1000}}}, Blocks: genBlocks(1)},
@@ -168,27 +168,33 @@ func TestGlobalSet(t *testing.T) {
 		t.Errorf("Global incorrect;\n A: %v !=\n E: %v", g, expectedGlobal)
 	}
 
-	globalFiles, globalDeleted, globalBytes := 0, 0, int64(0)
+	globalFiles, globalDirectories, globalDeleted, globalBytes := 0, 0, 0, int64(0)
 	for _, f := range g {
 		if f.IsInvalid() {
 			continue
 		}
-		if f.IsDeleted() {
+		switch {
+		case f.IsDeleted():
 			globalDeleted++
-		} else {
+		case f.IsDirectory():
+			globalDirectories++
+		default:
 			globalFiles++
 		}
 		globalBytes += f.FileSize()
 	}
-	gsFiles, gsDeleted, gsBytes := m.GlobalSize()
-	if gsFiles != globalFiles {
-		t.Errorf("Incorrect GlobalSize files; %d != %d", gsFiles, globalFiles)
+	gs := m.GlobalSize()
+	if gs.Files != globalFiles {
+		t.Errorf("Incorrect GlobalSize files; %d != %d", gs.Files, globalFiles)
 	}
-	if gsDeleted != globalDeleted {
-		t.Errorf("Incorrect GlobalSize deleted; %d != %d", gsDeleted, globalDeleted)
+	if gs.Directories != globalDirectories {
+		t.Errorf("Incorrect GlobalSize directories; %d != %d", gs.Directories, globalDirectories)
 	}
-	if gsBytes != globalBytes {
-		t.Errorf("Incorrect GlobalSize bytes; %d != %d", gsBytes, globalBytes)
+	if gs.Deleted != globalDeleted {
+		t.Errorf("Incorrect GlobalSize deleted; %d != %d", gs.Deleted, globalDeleted)
+	}
+	if gs.Bytes != globalBytes {
+		t.Errorf("Incorrect GlobalSize bytes; %d != %d", gs.Bytes, globalBytes)
 	}
 
 	h := fileList(haveList(m, protocol.LocalDeviceID))
@@ -198,27 +204,33 @@ func TestGlobalSet(t *testing.T) {
 		t.Errorf("Have incorrect;\n A: %v !=\n E: %v", h, localTot)
 	}
 
-	haveFiles, haveDeleted, haveBytes := 0, 0, int64(0)
+	haveFiles, haveDirectories, haveDeleted, haveBytes := 0, 0, 0, int64(0)
 	for _, f := range h {
 		if f.IsInvalid() {
 			continue
 		}
-		if f.IsDeleted() {
+		switch {
+		case f.IsDeleted():
 			haveDeleted++
-		} else {
+		case f.IsDirectory():
+			haveDirectories++
+		default:
 			haveFiles++
 		}
 		haveBytes += f.FileSize()
 	}
-	lsFiles, lsDeleted, lsBytes := m.LocalSize()
-	if lsFiles != haveFiles {
-		t.Errorf("Incorrect LocalSize files; %d != %d", lsFiles, haveFiles)
+	ls := m.LocalSize()
+	if ls.Files != haveFiles {
+		t.Errorf("Incorrect LocalSize files; %d != %d", ls.Files, haveFiles)
 	}
-	if lsDeleted != haveDeleted {
-		t.Errorf("Incorrect LocalSize deleted; %d != %d", lsDeleted, haveDeleted)
+	if ls.Directories != haveDirectories {
+		t.Errorf("Incorrect LocalSize directories; %d != %d", ls.Directories, haveDirectories)
 	}
-	if lsBytes != haveBytes {
-		t.Errorf("Incorrect LocalSize bytes; %d != %d", lsBytes, haveBytes)
+	if ls.Deleted != haveDeleted {
+		t.Errorf("Incorrect LocalSize deleted; %d != %d", ls.Deleted, haveDeleted)
+	}
+	if ls.Bytes != haveBytes {
+		t.Errorf("Incorrect LocalSize bytes; %d != %d", ls.Bytes, haveBytes)
 	}
 
 	h = fileList(haveList(m, remoteDevice0))
@@ -480,7 +492,7 @@ func TestNeed(t *testing.T) {
 	}
 }
 
-func TestLocalVersion(t *testing.T) {
+func TestSequence(t *testing.T) {
 	ldb := db.OpenMemory()
 
 	m := db.NewFileSet("test", ldb)
@@ -501,10 +513,10 @@ func TestLocalVersion(t *testing.T) {
 	}
 
 	m.Replace(protocol.LocalDeviceID, local1)
-	c0 := m.LocalVersion(protocol.LocalDeviceID)
+	c0 := m.Sequence(protocol.LocalDeviceID)
 
 	m.Replace(protocol.LocalDeviceID, local2)
-	c1 := m.LocalVersion(protocol.LocalDeviceID)
+	c1 := m.Sequence(protocol.LocalDeviceID)
 	if !(c1 > c0) {
 		t.Fatal("Local version number should have incremented")
 	}
@@ -686,4 +698,36 @@ func BenchmarkUpdateOneFile(b *testing.B) {
 	}
 
 	b.ReportAllocs()
+}
+
+func TestIndexID(t *testing.T) {
+	ldb := db.OpenMemory()
+
+	s := db.NewFileSet("test", ldb)
+
+	// The Index ID for some random device is zero by default.
+	id := s.IndexID(remoteDevice0)
+	if id != 0 {
+		t.Errorf("index ID for remote device should default to zero, not %d", id)
+	}
+
+	// The Index ID for someone else should be settable
+	s.SetIndexID(remoteDevice0, 42)
+	id = s.IndexID(remoteDevice0)
+	if id != 42 {
+		t.Errorf("index ID for remote device should be remembered; got %d, expected %d", id, 42)
+	}
+
+	// Our own index ID should be generated randomly.
+	id = s.IndexID(protocol.LocalDeviceID)
+	if id == 0 {
+		t.Errorf("index ID for local device should be random, not zero")
+	}
+	t.Logf("random index ID is 0x%016x", id)
+
+	// But of course always the same after that.
+	again := s.IndexID(protocol.LocalDeviceID)
+	if again != id {
+		t.Errorf("index ID changed; %d != %d", again, id)
+	}
 }

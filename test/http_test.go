@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // +build integration
 
@@ -27,6 +27,7 @@ var jsonEndpoints = []string{
 	"/rest/db/status?folder=default",
 	"/rest/db/browse?folder=default",
 	"/rest/events?since=-1&limit=5",
+	"/rest/events/disk?since=-1&limit=5",
 	"/rest/stats/device",
 	"/rest/stats/folder",
 	"/rest/svc/deviceid?id=I6KAH76-66SLLLB-5PFXSOA-UFJCDZC-YAOMLEK-CP2GB32-BV5RQST-3PSROAU",

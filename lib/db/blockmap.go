@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package db
 
@@ -209,7 +209,7 @@ func blockKeyInto(o, hash []byte, folder uint32, file string) []byte {
 	}
 	o[0] = KeyTypeBlock
 	binary.BigEndian.PutUint32(o[keyPrefixLen:], folder)
-	copy(o[keyPrefixLen+keyFolderLen:], []byte(hash))
+	copy(o[keyPrefixLen+keyFolderLen:], hash)
 	copy(o[keyPrefixLen+keyFolderLen+keyHashLen:], []byte(file))
 	return o
 }

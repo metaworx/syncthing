@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -19,10 +20,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/juju/ratelimit"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/relay/protocol"
 	"github.com/syncthing/syncthing/lib/tlsutil"
+	"golang.org/x/time/rate"
+
+	"github.com/syncthing/syncthing/lib/config"
+	"github.com/syncthing/syncthing/lib/nat"
+	_ "github.com/syncthing/syncthing/lib/pmp"
+	_ "github.com/syncthing/syncthing/lib/upnp"
 
 	syncthingprotocol "github.com/syncthing/syncthing/lib/protocol"
 )
@@ -62,20 +68,25 @@ var (
 	globalLimitBps  int
 	overLimit       int32
 	descriptorLimit int64
-	sessionLimiter  *ratelimit.Bucket
-	globalLimiter   *ratelimit.Bucket
+	sessionLimiter  *rate.Limiter
+	globalLimiter   *rate.Limiter
 
 	statusAddr       string
 	poolAddrs        string
 	pools            []string
 	providedBy       string
 	defaultPoolAddrs = "https://relays.syncthing.net/endpoint"
+
+	natEnabled bool
+	natLease   int
+	natRenewal int
+	natTimeout int
 )
 
 func main() {
 	log.SetFlags(log.Lshortfile | log.LstdFlags)
 
-	var dir, extAddress string
+	var dir, extAddress, proto string
 
 	flag.StringVar(&listen, "listen", ":22067", "Protocol listen address")
 	flag.StringVar(&dir, "keys", ".", "Directory where cert.pem and key.pem is stored")
@@ -89,16 +100,39 @@ func main() {
 	flag.StringVar(&poolAddrs, "pools", defaultPoolAddrs, "Comma separated list of relay pool addresses to join")
 	flag.StringVar(&providedBy, "provided-by", "", "An optional description about who provides the relay")
 	flag.StringVar(&extAddress, "ext-address", "", "An optional address to advertise as being available on.\n\tAllows listening on an unprivileged port with port forwarding from e.g. 443, and be connected to on port 443.")
-
+	flag.StringVar(&proto, "protocol", "tcp", "Protocol used for listening. 'tcp' for IPv4 and IPv6, 'tcp4' for IPv4, 'tcp6' for IPv6")
+	flag.BoolVar(&natEnabled, "nat", false, "Use UPnP/NAT-PMP to acquire external port mapping")
+	flag.IntVar(&natLease, "nat-lease", 60, "NAT lease length in minutes")
+	flag.IntVar(&natRenewal, "nat-renewal", 30, "NAT renewal frequency in minutes")
+	flag.IntVar(&natTimeout, "nat-timeout", 10, "NAT discovery timeout in seconds")
 	flag.Parse()
 
 	if extAddress == "" {
 		extAddress = listen
 	}
 
-	addr, err := net.ResolveTCPAddr("tcp", extAddress)
+	if len(providedBy) > 30 {
+		log.Fatal("Provided-by cannot be longer than 30 characters")
+	}
+
+	addr, err := net.ResolveTCPAddr(proto, extAddress)
 	if err != nil {
 		log.Fatal(err)
+	}
+
+	laddr, err := net.ResolveTCPAddr(proto, listen)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if laddr.IP != nil && !laddr.IP.IsUnspecified() {
+		laddr.Port = 0
+		transport, ok := http.DefaultTransport.(*http.Transport)
+		if ok {
+			transport.Dial = (&net.Dialer{
+				Timeout:   30 * time.Second,
+				LocalAddr: laddr,
+			}).Dial
+		}
 	}
 
 	log.Println(LongVersion)
@@ -149,18 +183,49 @@ func main() {
 		log.Println("ID:", id)
 	}
 
+	wrapper := config.Wrap("config", config.New(id))
+	wrapper.SetOptions(config.OptionsConfiguration{
+		NATLeaseM:   natLease,
+		NATRenewalM: natRenewal,
+		NATTimeoutS: natTimeout,
+	})
+	natSvc := nat.NewService(id, wrapper)
+	mapping := mapping{natSvc.NewMapping(nat.TCP, addr.IP, addr.Port)}
+
+	if natEnabled {
+		go natSvc.Serve()
+		found := make(chan struct{})
+		mapping.OnChanged(func(_ *nat.Mapping, _, _ []nat.Address) {
+			select {
+			case found <- struct{}{}:
+			default:
+			}
+		})
+
+		// Need to wait a few extra seconds, since NAT library waits exactly natTimeout seconds on all interfaces.
+		timeout := time.Duration(natTimeout+2) * time.Second
+		log.Printf("Waiting %s to acquire NAT mapping", timeout)
+
+		select {
+		case <-found:
+			log.Printf("Found NAT mapping: %s", mapping.ExternalAddresses())
+		case <-time.After(timeout):
+			log.Println("Timeout out waiting for NAT mapping.")
+		}
+	}
+
 	if sessionLimitBps > 0 {
-		sessionLimiter = ratelimit.NewBucketWithRate(float64(sessionLimitBps), int64(2*sessionLimitBps))
+		sessionLimiter = rate.NewLimiter(rate.Limit(sessionLimitBps), 2*sessionLimitBps)
 	}
 	if globalLimitBps > 0 {
-		globalLimiter = ratelimit.NewBucketWithRate(float64(globalLimitBps), int64(2*globalLimitBps))
+		globalLimiter = rate.NewLimiter(rate.Limit(globalLimitBps), 2*globalLimitBps)
 	}
 
 	if statusAddr != "" {
 		go statusService(statusAddr)
 	}
 
-	uri, err := url.Parse(fmt.Sprintf("relay://%s/?id=%s&pingInterval=%s&networkTimeout=%s&sessionLimitBps=%d&globalLimitBps=%d&statusAddr=%s&providedBy=%s", extAddress, id, pingInterval, networkTimeout, sessionLimitBps, globalLimitBps, statusAddr, providedBy))
+	uri, err := url.Parse(fmt.Sprintf("relay://%s/?id=%s&pingInterval=%s&networkTimeout=%s&sessionLimitBps=%d&globalLimitBps=%d&statusAddr=%s&providedBy=%s", mapping.Address(), id, pingInterval, networkTimeout, sessionLimitBps, globalLimitBps, statusAddr, providedBy))
 	if err != nil {
 		log.Fatalln("Failed to construct URI", err)
 	}
@@ -178,11 +243,11 @@ func main() {
 	for _, pool := range pools {
 		pool = strings.TrimSpace(pool)
 		if len(pool) > 0 {
-			go poolHandler(pool, uri)
+			go poolHandler(pool, uri, mapping)
 		}
 	}
 
-	go listener(listen, tlsCfg)
+	go listener(proto, listen, tlsCfg)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
@@ -212,7 +277,7 @@ func main() {
 
 func monitorLimits() {
 	limitCheckTimer = time.NewTimer(time.Minute)
-	for _ = range limitCheckTimer.C {
+	for range limitCheckTimer.C {
 		if atomic.LoadInt64(&numConnections)+atomic.LoadInt64(&numProxies) > descriptorLimit {
 			atomic.StoreInt32(&overLimit, 1)
 			log.Println("Gone past our connection limits. Starting to refuse new/drop idle connections.")
@@ -221,4 +286,16 @@ func monitorLimits() {
 		}
 		limitCheckTimer.Reset(time.Minute)
 	}
+}
+
+type mapping struct {
+	*nat.Mapping
+}
+
+func (m *mapping) Address() nat.Address {
+	ext := m.ExternalAddresses()
+	if len(ext) > 0 {
+		return ext[0]
+	}
+	return m.Mapping.Address()
 }

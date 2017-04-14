@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -66,7 +66,7 @@ func (s *verboseService) WaitForStart() {
 
 func (s *verboseService) formatEvent(ev events.Event) string {
 	switch ev.Type {
-	case events.Ping, events.DownloadProgress, events.LocalIndexUpdated:
+	case events.DownloadProgress, events.LocalIndexUpdated:
 		// Skip
 		return ""
 
@@ -94,8 +94,11 @@ func (s *verboseService) formatEvent(ev events.Event) string {
 
 	case events.LocalChangeDetected:
 		data := ev.Data.(map[string]string)
-		// Local change detected in folder "foo": modified file /Users/jb/whatever
 		return fmt.Sprintf("Local change detected in folder %q: %s %s %s", data["folder"], data["action"], data["type"], data["path"])
+
+	case events.RemoteChangeDetected:
+		data := ev.Data.(map[string]string)
+		return fmt.Sprintf("Remote change detected in folder %q: %s %s %s", data["folder"], data["action"], data["type"], data["path"])
 
 	case events.RemoteIndexUpdated:
 		data := ev.Data.(map[string]interface{})
@@ -151,7 +154,7 @@ func (s *verboseService) formatEvent(ev events.Event) string {
 		if total > 0 {
 			pct = 100 * current / total
 		}
-		return fmt.Sprintf("Scanning folder %q, %d%% done (%.01f MB/s)", folder, pct, rate)
+		return fmt.Sprintf("Scanning folder %q, %d%% done (%.01f MiB/s)", folder, pct, rate)
 
 	case events.DevicePaused:
 		data := ev.Data.(map[string]string)
@@ -162,6 +165,18 @@ func (s *verboseService) formatEvent(ev events.Event) string {
 		data := ev.Data.(map[string]string)
 		device := data["device"]
 		return fmt.Sprintf("Device %v was resumed", device)
+
+	case events.FolderPaused:
+		data := ev.Data.(map[string]string)
+		id := data["id"]
+		label := data["label"]
+		return fmt.Sprintf("Folder %v (%v) was paused", id, label)
+
+	case events.FolderResumed:
+		data := ev.Data.(map[string]string)
+		id := data["id"]
+		label := data["label"]
+		return fmt.Sprintf("Folder %v (%v) was resumed", id, label)
 
 	case events.ListenAddressesChanged:
 		data := ev.Data.(map[string]interface{})

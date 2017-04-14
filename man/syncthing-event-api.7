@@ -1,6 +1,6 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "SYNCTHING-EVENT-API" "7" "July 02, 2016" "v0.13" "Syncthing"
+.TH "SYNCTHING-EVENT-API" "7" "March 13, 2017" "v0.14" "Syncthing"
 .SH NAME
 syncthing-event-api \- Event API
 .
@@ -44,8 +44,9 @@ calls is long some events might be missed. This can be detected by noting a
 discontinuity in the event IDs.
 .sp
 If no new events are produced since \fB<lastSeenID>\fP, the HTTP call blocks and
-waits for new events to happen before returning, or if no new events are
-produced within 60 seconds, times out.
+waits for new events to happen before returning. By default it times out after
+60 seconds returning an empty array. The time out duration can be customized
+with the optional parameter \fBtimeout=seconds\fP\&.
 .sp
 To receive only a limited number of events, add the \fBlimit=n\fP parameter with a
 suitable value for \fBn\fP and only the \fIlast\fP \fBn\fP events will be returned. This
@@ -61,6 +62,7 @@ Each event is represented by an object similar to the following:
 .ft C
 {
     "id": 2,
+    "globalID": 3,
     "type": "DeviceConnected",
     "time": "2014\-07\-13T21:04:33.687836696+02:00",
     "data": {
@@ -73,13 +75,19 @@ Each event is represented by an object similar to the following:
 .UNINDENT
 .UNINDENT
 .sp
-The top level keys \fBid\fP, \fBtime\fP, \fBtype\fP and \fBdata\fP are always present,
+The top level keys \fBid\fP, \fBglobalID\fP, \fBtime\fP, \fBtype\fP and \fBdata\fP are always present,
 though \fBdata\fP may be \fBnull\fP\&.
 .INDENT 0.0
 .TP
 .B id
-A monotonically increasing integer. The first event generated has id \fB1\fP,
-the next has id \fB2\fP etc.
+A unique ID for this event on the events API. It always increases by 1: the first
+event generated has id \fB1\fP, the next has id \fB2\fP etc. If this increases by
+more than 1, then one or more events have been skipped by the events API.
+.TP
+.B globalID
+A global ID for this event, across the events API, the audit log, and any other
+sources. It may increase by more than 1, but it will always be greater
+than or equal to the id.
 .TP
 .B time
 The time the event was generated.
@@ -92,7 +100,7 @@ types below.
 An object containing optional extra information; the exact structure is
 determined by the event type.
 .UNINDENT
-.SH EVENTS
+.SH EVENT TYPES
 .SS ConfigSaved
 .sp
 Emitted after the config has been saved by the user or by Syncthing
@@ -106,12 +114,12 @@ itself.
     "id": 50,
     "type": "ConfigSaved",
     "time": "2014\-12\-13T00:09:13.5166486Z",
-    "data":{
+    "data": {
         "Version": 7,
-        "Options": { ... },
-        "GUI": { ... },
-        "Devices": [ ... ],
-        "Folders": [ ... ]
+        "Options": {"..."},
+        "GUI": {"..."},
+        "Devices": [{"..."}],
+        "Folders": [{"..."}]
     }
 }
 .ft P
@@ -561,6 +569,33 @@ The \fBaction\fP field is either \fBupdate\fP (contents changed), \fBmetadata\fP
 .sp
 New in version 0.11.10: The \fBmetadata\fP action.
 
+.SS LocalChangeDetected
+.sp
+Generated upon scan whenever the local disk has discovered an updated file from the
+previous scan.  This does NOT include events that are discovered and copied from
+other devices, only files that were changed on the local filesystem.
+.INDENT 0.0
+.INDENT 3.5
+.sp
+.nf
+.ft C
+{
+  "id": 7,
+  "globalID": 59,
+  "time": "2016\-09\-26T22:07:10.7189141\-04:00",
+  "type": "LocalChangeDetected",
+  "data": {
+    "action": "deleted",
+    "folderID": "vitwy\-zjxqt",
+    "label": "TestSync",
+    "path": "C:\e\eUsers\e\eNate\e\eSync\e\etestfolder\e\etest file.rtf",
+    "type": "file"
+  }
+}
+.ft P
+.fi
+.UNINDENT
+.UNINDENT
 .SS LocalIndexUpdated
 .sp
 Generated when the local index information has changed, due to
@@ -579,26 +614,6 @@ changes during a scan.
         "folder": "default",
         "items": 1000,
     }
-}
-.ft P
-.fi
-.UNINDENT
-.UNINDENT
-.SS Ping
-.sp
-The Ping event is generated automatically every 60 seconds. This means
-that even in the absence of any other activity, the event polling HTTP
-request will return within a minute.
-.INDENT 0.0
-.INDENT 3.5
-.sp
-.nf
-.ft C
-{
-    "id": 46,
-    "type": "Ping",
-    "time": "2014\-07\-13T21:13:18.502171586+02:00",
-    "data": null
 }
 .ft P
 .fi

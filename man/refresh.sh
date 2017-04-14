@@ -1,8 +1,10 @@
-#!/bin/sh
+#!/bin/bash
 
-base=http://docs.syncthing.net/man/
+base=https://docs.syncthing.net/man/
 pages=(
 	syncthing.1
+	stdiscosrv.1
+	strelaysrv.1
 	syncthing-config.5
 	syncthing-stignore.5
 	syncthing-device-ids.7

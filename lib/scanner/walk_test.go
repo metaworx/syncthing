@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package scanner
 
@@ -23,7 +23,6 @@ import (
 	"github.com/syncthing/syncthing/lib/ignore"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
-	"github.com/syncthing/syncthing/lib/symlinks"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -192,7 +191,7 @@ func TestVerify(t *testing.T) {
 	progress := newByteCounter()
 	defer progress.Close()
 
-	blocks, err := Blocks(buf, blocksize, 0, progress)
+	blocks, err := Blocks(buf, blocksize, -1, progress, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,6 +324,88 @@ func TestIssue1507(t *testing.T) {
 	fn("", nil, protocol.ErrClosed)
 }
 
+func TestWalkSymlinkUnix(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping unsupported symlink test")
+		return
+	}
+
+	// Create a folder with a symlink in it
+
+	os.RemoveAll("_symlinks")
+	defer os.RemoveAll("_symlinks")
+
+	os.Mkdir("_symlinks", 0755)
+	os.Symlink("destination", "_symlinks/link")
+
+	// Scan it
+
+	fchan, err := Walk(Config{
+		Dir:       "_symlinks",
+		BlockSize: 128 * 1024,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var files []protocol.FileInfo
+	for f := range fchan {
+		files = append(files, f)
+	}
+
+	// Verify that we got one symlink and with the correct attributes
+
+	if len(files) != 1 {
+		t.Errorf("expected 1 symlink, not %d", len(files))
+	}
+	if len(files[0].Blocks) != 0 {
+		t.Errorf("expected zero blocks for symlink, not %d", len(files[0].Blocks))
+	}
+	if files[0].SymlinkTarget != "destination" {
+		t.Errorf("expected symlink to have target destination, not %q", files[0].SymlinkTarget)
+	}
+}
+
+func TestWalkSymlinkWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("skipping unsupported symlink test")
+	}
+
+	// Create a folder with a symlink in it
+
+	os.RemoveAll("_symlinks")
+	defer os.RemoveAll("_symlinks")
+
+	os.Mkdir("_symlinks", 0755)
+	if err := os.Symlink("destination", "_symlinks/link"); err != nil {
+		// Probably we require permissions we don't have.
+		t.Skip(err)
+	}
+
+	// Scan it
+
+	fchan, err := Walk(Config{
+		Dir:       "_symlinks",
+		BlockSize: 128 * 1024,
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var files []protocol.FileInfo
+	for f := range fchan {
+		files = append(files, f)
+	}
+
+	// Verify that we got zero symlinks
+
+	if len(files) != 0 {
+		t.Errorf("expected zero symlinks, not %d", len(files))
+	}
+}
+
 func walkDir(dir string) ([]protocol.FileInfo, error) {
 	fchan, err := Walk(Config{
 		Dir:           dir,
@@ -384,34 +465,6 @@ func (l testfileList) String() string {
 	return b.String()
 }
 
-func TestSymlinkTypeEqual(t *testing.T) {
-	testcases := []struct {
-		onDiskType symlinks.TargetType
-		fiType     protocol.FileInfoType
-		equal      bool
-	}{
-		// File is only equal to file
-		{symlinks.TargetFile, protocol.FileInfoTypeSymlinkFile, true},
-		{symlinks.TargetFile, protocol.FileInfoTypeSymlinkDirectory, false},
-		{symlinks.TargetFile, protocol.FileInfoTypeSymlinkUnknown, false},
-		// Directory is only equal to directory
-		{symlinks.TargetDirectory, protocol.FileInfoTypeSymlinkFile, false},
-		{symlinks.TargetDirectory, protocol.FileInfoTypeSymlinkDirectory, true},
-		{symlinks.TargetDirectory, protocol.FileInfoTypeSymlinkUnknown, false},
-		// Unknown is equal to anything
-		{symlinks.TargetUnknown, protocol.FileInfoTypeSymlinkFile, true},
-		{symlinks.TargetUnknown, protocol.FileInfoTypeSymlinkDirectory, true},
-		{symlinks.TargetUnknown, protocol.FileInfoTypeSymlinkUnknown, true},
-	}
-
-	for _, tc := range testcases {
-		res := SymlinkTypeEqual(tc.onDiskType, protocol.FileInfo{Type: tc.fiType})
-		if res != tc.equal {
-			t.Errorf("Incorrect result %v for %v, %v", res, tc.onDiskType, tc.fiType)
-		}
-	}
-}
-
 var initOnce sync.Once
 
 const (
@@ -424,11 +477,12 @@ func BenchmarkHashFile(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		if _, err := HashFile(testdataName, protocol.BlockSize, testdataSize, nil); err != nil {
+		if _, err := HashFile(testdataName, protocol.BlockSize, nil, true); err != nil {
 			b.Fatal(err)
 		}
 	}
 
+	b.SetBytes(testdataSize)
 	b.ReportAllocs()
 }
 

@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package model
 
@@ -60,6 +60,7 @@ func TestProgressEmitter(t *testing.T) {
 
 	p := NewProgressEmitter(c)
 	go p.Serve()
+	p.interval = 0
 
 	expectTimeout(w, t)
 
@@ -106,7 +107,7 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 		TempIndexMinBlocks:      10,
 	})
 
-	fc := &FakeConnection{}
+	fc := &fakeConnection{}
 
 	p := NewProgressEmitter(c)
 	p.temporaryIndexSubscribe(fc, []string{"folder", "folder2"})
@@ -358,7 +359,7 @@ func TestSendDownloadProgressMessages(t *testing.T) {
 		file: protocol.FileInfo{
 			Name:    "state6",
 			Version: v1,
-			Type:    protocol.FileInfoTypeSymlinkUnknown,
+			Type:    protocol.FileInfoTypeSymlink,
 		},
 		mut:              sync.NewRWMutex(),
 		available:        []int32{1, 2, 3},

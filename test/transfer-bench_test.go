@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // +build integration,benchmark
 
@@ -11,8 +11,6 @@ package integration
 import (
 	"log"
 	"os"
-	"runtime"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -50,7 +48,8 @@ func benchmarkTransfer(t *testing.T, files, sizeExp int) {
 	log.Println("Generating files...")
 	if files == 1 {
 		// Special case. Generate one file with the specified size exactly.
-		fd, err := os.Open("../LICENSE")
+		var fd *os.File
+		fd, err = os.Open("../LICENSE")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -141,24 +140,6 @@ loop:
 	log.Println("Result: Wall time:", t1.Sub(t0))
 	log.Printf("Result: %.1f MiB/s synced", float64(total)/1024/1024/t1.Sub(t0).Seconds())
 
-	if rusage, ok := recvProc.SysUsage().(*syscall.Rusage); ok {
-		log.Println("Receiver: Utime:", time.Duration(rusage.Utime.Nano()))
-		log.Println("Receiver: Stime:", time.Duration(rusage.Stime.Nano()))
-		if runtime.GOOS == "darwin" {
-			// Darwin reports in bytes, Linux seems to report in KiB even
-			// though the manpage says otherwise.
-			rusage.Maxrss /= 1024
-		}
-		log.Println("Receiver: MaxRSS:", rusage.Maxrss, "KiB")
-	}
-	if rusage, ok := sendProc.SysUsage().(*syscall.Rusage); ok {
-		log.Println("Sender: Utime:", time.Duration(rusage.Utime.Nano()))
-		log.Println("Sender: Stime:", time.Duration(rusage.Stime.Nano()))
-		if runtime.GOOS == "darwin" {
-			// Darwin reports in bytes, Linux seems to report in KiB even
-			// though the manpage says otherwise.
-			rusage.Maxrss /= 1024
-		}
-		log.Println("Sender: MaxRSS:", rusage.Maxrss, "KiB")
-	}
+	printUsage("Receiver", recvProc)
+	printUsage("Sender", sendProc)
 }

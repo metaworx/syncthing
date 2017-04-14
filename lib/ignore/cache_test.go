@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package ignore
 
@@ -15,7 +15,7 @@ func TestCache(t *testing.T) {
 	c := newCache(nil)
 
 	res, ok := c.get("nonexistent")
-	if res.IsIgnored() || res.IsDeletable() || ok != false {
+	if res.IsIgnored() || res.IsDeletable() || ok {
 		t.Errorf("res %v, ok %v for nonexistent item", res, ok)
 	}
 
@@ -25,12 +25,12 @@ func TestCache(t *testing.T) {
 	c.set("false", 0)
 
 	res, ok = c.get("true")
-	if !res.IsIgnored() || !res.IsDeletable() || ok != true {
+	if !res.IsIgnored() || !res.IsDeletable() || !ok {
 		t.Errorf("res %v, ok %v for true item", res, ok)
 	}
 
 	res, ok = c.get("false")
-	if res.IsIgnored() || res.IsDeletable() || ok != true {
+	if res.IsIgnored() || res.IsDeletable() || !ok {
 		t.Errorf("res %v, ok %v for false item", res, ok)
 	}
 
@@ -41,12 +41,12 @@ func TestCache(t *testing.T) {
 	// Same values should exist
 
 	res, ok = c.get("true")
-	if !res.IsIgnored() || !res.IsDeletable() || ok != true {
+	if !res.IsIgnored() || !res.IsDeletable() || !ok {
 		t.Errorf("res %v, ok %v for true item", res, ok)
 	}
 
 	res, ok = c.get("false")
-	if res.IsIgnored() || res.IsDeletable() || ok != true {
+	if res.IsIgnored() || res.IsDeletable() || !ok {
 		t.Errorf("res %v, ok %v for false item", res, ok)
 	}
 

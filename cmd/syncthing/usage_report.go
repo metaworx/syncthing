@@ -2,14 +2,13 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
 import (
 	"bytes"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
@@ -23,6 +22,7 @@ import (
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/upgrade"
 	"github.com/thejerf/suture"
 )
@@ -45,7 +45,7 @@ func newUsageReportingManager(cfg *config.Wrapper, m *model.Model) *usageReporti
 	}
 
 	// Start UR if it's enabled.
-	mgr.CommitConfiguration(config.Configuration{}, cfg.Raw())
+	mgr.CommitConfiguration(config.Configuration{}, cfg.RawCopy())
 
 	// Listen to future config changes so that we can start and stop as
 	// appropriate.
@@ -81,9 +81,10 @@ func (m *usageReportingManager) String() string {
 // reportData returns the data to be sent in a usage report. It's used in
 // various places, so not part of the usageReportingManager object.
 func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
+	opts := cfg.Options()
 	res := make(map[string]interface{})
 	res["urVersion"] = usageReportVersion
-	res["uniqueID"] = cfg.Options().URUniqueID
+	res["uniqueID"] = opts.URUniqueID
 	res["version"] = Version
 	res["longVersion"] = LongVersion
 	res["platform"] = runtime.GOOS + "-" + runtime.GOARCH
@@ -93,14 +94,14 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	var totFiles, maxFiles int
 	var totBytes, maxBytes int64
 	for folderID := range cfg.Folders() {
-		files, _, bytes := m.GlobalSize(folderID)
-		totFiles += files
-		totBytes += bytes
-		if files > maxFiles {
-			maxFiles = files
+		global := m.GlobalSize(folderID)
+		totFiles += global.Files
+		totBytes += global.Bytes
+		if global.Files > maxFiles {
+			maxFiles = global.Files
 		}
-		if bytes > maxBytes {
-			maxBytes = bytes
+		if global.Bytes > maxBytes {
+			maxBytes = global.Bytes
 		}
 	}
 
@@ -112,7 +113,8 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
 	res["memoryUsageMiB"] = (mem.Sys - mem.HeapReleased) / 1024 / 1024
-	res["sha256Perf"] = cpuBench(5, 125*time.Millisecond)
+	res["sha256Perf"] = cpuBench(5, 125*time.Millisecond, false)
+	res["hashPerf"] = cpuBench(5, 125*time.Millisecond, true)
 
 	bytes, err := memorySize()
 	if err == nil {
@@ -134,7 +136,7 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	for _, cfg := range cfg.Folders() {
 		rescanIntvs = append(rescanIntvs, cfg.RescanIntervalS)
 
-		if cfg.Type == config.FolderTypeReadOnly {
+		if cfg.Type == config.FolderTypeSendOnly {
 			folderUses["readonly"]++
 		}
 		if cfg.IgnorePerms {
@@ -188,7 +190,7 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	res["deviceUses"] = deviceUses
 
 	defaultAnnounceServersDNS, defaultAnnounceServersIP, otherAnnounceServers := 0, 0, 0
-	for _, addr := range cfg.Options().GlobalAnnServers {
+	for _, addr := range opts.GlobalAnnServers {
 		if addr == "default" || addr == "default-v4" || addr == "default-v6" {
 			defaultAnnounceServersDNS++
 		} else {
@@ -196,8 +198,8 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 		}
 	}
 	res["announce"] = map[string]interface{}{
-		"globalEnabled":     cfg.Options().GlobalAnnEnabled,
-		"localEnabled":      cfg.Options().LocalAnnEnabled,
+		"globalEnabled":     opts.GlobalAnnEnabled,
+		"localEnabled":      opts.LocalAnnEnabled,
 		"defaultServersDNS": defaultAnnounceServersDNS,
 		"defaultServersIP":  defaultAnnounceServersIP,
 		"otherServers":      otherAnnounceServers,
@@ -218,10 +220,11 @@ func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 		"otherServers":   otherRelayServers,
 	}
 
-	res["usesRateLimit"] = cfg.Options().MaxRecvKbps > 0 || cfg.Options().MaxSendKbps > 0
+	res["usesRateLimit"] = opts.MaxRecvKbps > 0 || opts.MaxSendKbps > 0
 
-	res["upgradeAllowedManual"] = !(upgrade.DisabledByCompilation || noUpgrade)
-	res["upgradeAllowedAuto"] = !(upgrade.DisabledByCompilation || noUpgrade) && cfg.Options().AutoUpgradeIntervalH > 0
+	res["upgradeAllowedManual"] = !(upgrade.DisabledByCompilation || noUpgradeFromEnv)
+	res["upgradeAllowedAuto"] = !(upgrade.DisabledByCompilation || noUpgradeFromEnv) && opts.AutoUpgradeIntervalH > 0
+	res["upgradeAllowedPre"] = !(upgrade.DisabledByCompilation || noUpgradeFromEnv) && opts.AutoUpgradeIntervalH > 0 && opts.UpgradeToPreReleases
 
 	return res
 }
@@ -284,29 +287,31 @@ func (s *usageReportingService) Stop() {
 }
 
 // cpuBench returns CPU performance as a measure of single threaded SHA-256 MiB/s
-func cpuBench(iterations int, duration time.Duration) float64 {
+func cpuBench(iterations int, duration time.Duration, useWeakHash bool) float64 {
+	dataSize := 16 * protocol.BlockSize
+	bs := make([]byte, dataSize)
+	rand.Reader.Read(bs)
+
 	var perf float64
 	for i := 0; i < iterations; i++ {
-		if v := cpuBenchOnce(duration); v > perf {
+		if v := cpuBenchOnce(duration, useWeakHash, bs); v > perf {
 			perf = v
 		}
 	}
+	blocksResult = nil
 	return perf
 }
 
-func cpuBenchOnce(duration time.Duration) float64 {
-	chunkSize := 100 * 1 << 10
-	h := sha256.New()
-	bs := make([]byte, chunkSize)
-	rand.Reader.Read(bs)
+var blocksResult []protocol.BlockInfo // so the result is not optimized away
 
+func cpuBenchOnce(duration time.Duration, useWeakHash bool, bs []byte) float64 {
 	t0 := time.Now()
 	b := 0
 	for time.Since(t0) < duration {
-		h.Write(bs)
-		b += chunkSize
+		r := bytes.NewReader(bs)
+		blocksResult, _ = scanner.Blocks(r, protocol.BlockSize, int64(len(bs)), nil, useWeakHash)
+		b += len(bs)
 	}
-	h.Sum(nil)
 	d := time.Since(t0)
 	return float64(int(float64(b)/d.Seconds()/(1<<20)*100)) / 100
 }

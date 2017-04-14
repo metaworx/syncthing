@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package db
 
@@ -24,11 +24,12 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
-type deletionHandler func(t readWriteTransaction, folder, device, name []byte, dbi iterator.Iterator) int64
+type deletionHandler func(t readWriteTransaction, folder, device, name []byte, dbi iterator.Iterator)
 
 type Instance struct {
 	committed int64 // this must be the first attribute in the struct to ensure 64 bit alignment on 32 bit plaforms
 	*leveldb.DB
+	location  string
 	folderIdx *smallIndex
 	deviceIdx *smallIndex
 }
@@ -64,17 +65,18 @@ func Open(file string) (*Instance, error) {
 		return nil, err
 	}
 
-	return newDBInstance(db), nil
+	return newDBInstance(db, file), nil
 }
 
 func OpenMemory() *Instance {
 	db, _ := leveldb.Open(storage.NewMemStorage(), nil)
-	return newDBInstance(db)
+	return newDBInstance(db, "<memory>")
 }
 
-func newDBInstance(db *leveldb.DB) *Instance {
+func newDBInstance(db *leveldb.DB, location string) *Instance {
 	i := &Instance{
-		DB: db,
+		DB:       db,
+		location: location,
 	}
 	i.folderIdx = newSmallIndex(i, []byte{KeyTypeFolderIdx})
 	i.deviceIdx = newSmallIndex(i, []byte{KeyTypeDeviceIdx})
@@ -86,7 +88,12 @@ func (db *Instance) Committed() int64 {
 	return atomic.LoadInt64(&db.committed)
 }
 
-func (db *Instance) genericReplace(folder, device []byte, fs []protocol.FileInfo, localSize, globalSize *sizeTracker, deleteFn deletionHandler) int64 {
+// Location returns the filesystem path where the database is stored
+func (db *Instance) Location() string {
+	return db.location
+}
+
+func (db *Instance) genericReplace(folder, device []byte, fs []protocol.FileInfo, localSize, globalSize *sizeTracker, deleteFn deletionHandler) {
 	sort.Sort(fileList(fs)) // sort list on name, same as in the database
 
 	t := db.newReadWriteTransaction()
@@ -97,7 +104,6 @@ func (db *Instance) genericReplace(folder, device []byte, fs []protocol.FileInfo
 
 	moreDb := dbi.Next()
 	fsi := 0
-	var maxLocalVer int64
 
 	isLocalDevice := bytes.Equal(device, protocol.LocalDeviceID[:])
 	for {
@@ -124,9 +130,7 @@ func (db *Instance) genericReplace(folder, device []byte, fs []protocol.FileInfo
 		case moreFs && (!moreDb || cmp == -1):
 			l.Debugln("generic replace; missing - insert")
 			// Database is missing this file. Insert it.
-			if lv := t.insertFile(folder, device, fs[fsi]); lv > maxLocalVer {
-				maxLocalVer = lv
-			}
+			t.insertFile(folder, device, fs[fsi])
 			if isLocalDevice {
 				localSize.addFile(fs[fsi])
 			}
@@ -146,9 +150,7 @@ func (db *Instance) genericReplace(folder, device []byte, fs []protocol.FileInfo
 			ef.Unmarshal(dbi.Value())
 			if !fs[fsi].Version.Equal(ef.Version) || fs[fsi].Invalid != ef.Invalid {
 				l.Debugln("generic replace; differs - insert")
-				if lv := t.insertFile(folder, device, fs[fsi]); lv > maxLocalVer {
-					maxLocalVer = lv
-				}
+				t.insertFile(folder, device, fs[fsi])
 				if isLocalDevice {
 					localSize.removeFile(ef)
 					localSize.addFile(fs[fsi])
@@ -167,9 +169,7 @@ func (db *Instance) genericReplace(folder, device []byte, fs []protocol.FileInfo
 
 		case moreDb && (!moreFs || cmp == 1):
 			l.Debugln("generic replace; exists - remove")
-			if lv := deleteFn(t, folder, device, oldName, dbi); lv > maxLocalVer {
-				maxLocalVer = lv
-			}
+			deleteFn(t, folder, device, oldName, dbi)
 			moreDb = dbi.Next()
 		}
 
@@ -177,26 +177,21 @@ func (db *Instance) genericReplace(folder, device []byte, fs []protocol.FileInfo
 		// growing too large and thus allocating unnecessarily much memory.
 		t.checkFlush()
 	}
-
-	return maxLocalVer
 }
 
-func (db *Instance) replace(folder, device []byte, fs []protocol.FileInfo, localSize, globalSize *sizeTracker) int64 {
-	// TODO: Return the remaining maxLocalVer?
-	return db.genericReplace(folder, device, fs, localSize, globalSize, func(t readWriteTransaction, folder, device, name []byte, dbi iterator.Iterator) int64 {
+func (db *Instance) replace(folder, device []byte, fs []protocol.FileInfo, localSize, globalSize *sizeTracker) {
+	db.genericReplace(folder, device, fs, localSize, globalSize, func(t readWriteTransaction, folder, device, name []byte, dbi iterator.Iterator) {
 		// Database has a file that we are missing. Remove it.
 		l.Debugf("delete; folder=%q device=%v name=%q", folder, protocol.DeviceIDFromBytes(device), name)
 		t.removeFromGlobal(folder, device, name, globalSize)
 		t.Delete(dbi.Key())
-		return 0
 	})
 }
 
-func (db *Instance) updateFiles(folder, device []byte, fs []protocol.FileInfo, localSize, globalSize *sizeTracker) int64 {
+func (db *Instance) updateFiles(folder, device []byte, fs []protocol.FileInfo, localSize, globalSize *sizeTracker) {
 	t := db.newReadWriteTransaction()
 	defer t.close()
 
-	var maxLocalVer int64
 	var fk []byte
 	isLocalDevice := bytes.Equal(device, protocol.LocalDeviceID[:])
 	for _, f := range fs {
@@ -208,9 +203,7 @@ func (db *Instance) updateFiles(folder, device []byte, fs []protocol.FileInfo, l
 				localSize.addFile(f)
 			}
 
-			if lv := t.insertFile(folder, device, f); lv > maxLocalVer {
-				maxLocalVer = lv
-			}
+			t.insertFile(folder, device, f)
 			if f.IsInvalid() {
 				t.removeFromGlobal(folder, device, name, globalSize)
 			} else {
@@ -231,9 +224,7 @@ func (db *Instance) updateFiles(folder, device []byte, fs []protocol.FileInfo, l
 				localSize.addFile(f)
 			}
 
-			if lv := t.insertFile(folder, device, f); lv > maxLocalVer {
-				maxLocalVer = lv
-			}
+			t.insertFile(folder, device, f)
 			if f.IsInvalid() {
 				t.removeFromGlobal(folder, device, name, globalSize)
 			} else {
@@ -245,8 +236,6 @@ func (db *Instance) updateFiles(folder, device []byte, fs []protocol.FileInfo, l
 		// growing too large and thus allocating unnecessarily much memory.
 		t.checkFlush()
 	}
-
-	return maxLocalVer
 }
 
 func (db *Instance) withHave(folder, device, prefix []byte, truncate bool, fn Iterator) {
@@ -537,9 +526,9 @@ func (db *Instance) ListFolders() []string {
 
 	folderExists := make(map[string]bool)
 	for dbi.Next() {
-		folder := string(db.globalKeyFolder(dbi.Key()))
-		if !folderExists[folder] {
-			folderExists[folder] = true
+		folder, ok := db.globalKeyFolder(dbi.Key())
+		if ok && !folderExists[string(folder)] {
+			folderExists[string(folder)] = true
 		}
 	}
 
@@ -569,8 +558,8 @@ func (db *Instance) dropFolder(folder []byte) {
 	// Remove all items related to the given folder from the global bucket
 	dbi = t.NewIterator(util.BytesPrefix([]byte{KeyTypeGlobal}), nil)
 	for dbi.Next() {
-		itemFolder := db.globalKeyFolder(dbi.Key())
-		if bytes.Equal(folder, itemFolder) {
+		itemFolder, ok := db.globalKeyFolder(dbi.Key())
+		if ok && bytes.Equal(folder, itemFolder) {
 			db.Delete(dbi.Key(), nil)
 		}
 	}
@@ -629,6 +618,41 @@ func (db *Instance) checkGlobals(folder []byte, globalSize *sizeTracker) {
 	l.Debugf("db check completed for %q", folder)
 }
 
+// ConvertSymlinkTypes should be run once only on an old database. It
+// changes SYMLINK_FILE and SYMLINK_DIRECTORY types to the current SYMLINK
+// type (previously SYMLINK_UNKNOWN). It does this for all devices, both
+// local and remote, and does not reset delta indexes. It shouldn't really
+// matter what the symlink type is, but this cleans it up for a possible
+// future when SYMLINK_FILE and SYMLINK_DIRECTORY are no longer understood.
+func (db *Instance) ConvertSymlinkTypes() {
+	t := db.newReadWriteTransaction()
+	defer t.close()
+
+	dbi := t.NewIterator(util.BytesPrefix([]byte{KeyTypeDevice}), nil)
+	defer dbi.Release()
+
+	conv := 0
+	for dbi.Next() {
+		var f protocol.FileInfo
+		if err := f.Unmarshal(dbi.Value()); err != nil {
+			// probably can't happen
+			continue
+		}
+		if f.Type == protocol.FileInfoTypeDeprecatedSymlinkDirectory || f.Type == protocol.FileInfoTypeDeprecatedSymlinkFile {
+			f.Type = protocol.FileInfoTypeSymlink
+			bs, err := f.Marshal()
+			if err != nil {
+				panic("can't happen: " + err.Error())
+			}
+			t.Put(dbi.Key(), bs)
+			t.checkFlush()
+			conv++
+		}
+	}
+
+	l.Infof("Updated symlink type for %d index entries", conv)
+}
+
 // deviceKey returns a byte slice encoding the following information:
 //	   keyTypeDevice (1 byte)
 //	   folder (4 bytes)
@@ -646,7 +670,7 @@ func (db *Instance) deviceKeyInto(k []byte, folder, device, file []byte) []byte 
 	k[0] = KeyTypeDevice
 	binary.BigEndian.PutUint32(k[keyPrefixLen:], db.folderIdx.ID(folder))
 	binary.BigEndian.PutUint32(k[keyPrefixLen+keyFolderLen:], db.deviceIdx.ID(device))
-	copy(k[keyPrefixLen+keyFolderLen+keyDeviceLen:], []byte(file))
+	copy(k[keyPrefixLen+keyFolderLen+keyDeviceLen:], file)
 	return k[:reqLen]
 }
 
@@ -681,7 +705,7 @@ func (db *Instance) globalKey(folder, file []byte) []byte {
 	k := make([]byte, keyPrefixLen+keyFolderLen+len(file))
 	k[0] = KeyTypeGlobal
 	binary.BigEndian.PutUint32(k[keyPrefixLen:], db.folderIdx.ID(folder))
-	copy(k[keyPrefixLen+keyFolderLen:], []byte(file))
+	copy(k[keyPrefixLen+keyFolderLen:], file)
 	return k
 }
 
@@ -691,12 +715,68 @@ func (db *Instance) globalKeyName(key []byte) []byte {
 }
 
 // globalKeyFolder returns the folder name from the key
-func (db *Instance) globalKeyFolder(key []byte) []byte {
-	folder, ok := db.folderIdx.Val(binary.BigEndian.Uint32(key[keyPrefixLen:]))
-	if !ok {
-		panic("bug: lookup of nonexistent folder ID")
+func (db *Instance) globalKeyFolder(key []byte) ([]byte, bool) {
+	return db.folderIdx.Val(binary.BigEndian.Uint32(key[keyPrefixLen:]))
+}
+
+func (db *Instance) getIndexID(device, folder []byte) protocol.IndexID {
+	key := db.indexIDKey(device, folder)
+	cur, err := db.Get(key, nil)
+	if err != nil {
+		return 0
 	}
-	return folder
+
+	var id protocol.IndexID
+	if err := id.Unmarshal(cur); err != nil {
+		return 0
+	}
+
+	return id
+}
+
+func (db *Instance) setIndexID(device, folder []byte, id protocol.IndexID) {
+	key := db.indexIDKey(device, folder)
+	bs, _ := id.Marshal() // marshalling can't fail
+	if err := db.Put(key, bs, nil); err != nil {
+		panic("storing index ID: " + err.Error())
+	}
+}
+
+func (db *Instance) indexIDKey(device, folder []byte) []byte {
+	k := make([]byte, keyPrefixLen+keyDeviceLen+keyFolderLen)
+	k[0] = KeyTypeIndexID
+	binary.BigEndian.PutUint32(k[keyPrefixLen:], db.deviceIdx.ID(device))
+	binary.BigEndian.PutUint32(k[keyPrefixLen+keyDeviceLen:], db.folderIdx.ID(folder))
+	return k
+}
+
+func (db *Instance) mtimesKey(folder []byte) []byte {
+	prefix := make([]byte, 5) // key type + 4 bytes folder idx number
+	prefix[0] = KeyTypeVirtualMtime
+	binary.BigEndian.PutUint32(prefix[1:], db.folderIdx.ID(folder))
+	return prefix
+}
+
+// DropDeltaIndexIDs removes all index IDs from the database. This will
+// cause a full index transmission on the next connection.
+func (db *Instance) DropDeltaIndexIDs() {
+	db.dropPrefix([]byte{KeyTypeIndexID})
+}
+
+func (db *Instance) dropMtimes(folder []byte) {
+	db.dropPrefix(db.mtimesKey(folder))
+}
+
+func (db *Instance) dropPrefix(prefix []byte) {
+	t := db.newReadWriteTransaction()
+	defer t.close()
+
+	dbi := t.NewIterator(util.BytesPrefix(prefix), nil)
+	defer dbi.Release()
+
+	for dbi.Next() {
+		t.Delete(dbi.Key())
+	}
 }
 
 func unmarshalTrunc(bs []byte, truncate bool) (FileIntf, error) {

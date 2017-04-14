@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -130,7 +130,7 @@ func printProgress(prefix string, count *int64) {
 	expectedIterations := float64(int(1) << uint(wantBits))
 	fmt.Printf("Want %d bits for prefix %q, about %.2g certs to test (statistically speaking)\n", wantBits, prefix, expectedIterations)
 
-	for _ = range time.NewTicker(15 * time.Second).C {
+	for range time.NewTicker(15 * time.Second).C {
 		tried := atomic.LoadInt64(count)
 		elapsed := time.Since(started)
 		rate := float64(tried) / elapsed.Seconds()

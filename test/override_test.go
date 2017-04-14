@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // +build integration
 
@@ -27,7 +27,7 @@ func TestOverride(t *testing.T) {
 	id, _ := protocol.DeviceIDFromString(id1)
 	cfg, _ := config.Load("h1/config.xml", id)
 	fld := cfg.Folders()["default"]
-	fld.Type = config.FolderTypeReadOnly
+	fld.Type = config.FolderTypeSendOnly
 	cfg.SetFolder(fld)
 	os.Rename("h1/config.xml", "h1/config.xml.orig")
 	defer osutil.Rename("h1/config.xml.orig", "h1/config.xml")

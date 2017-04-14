@@ -2,14 +2,14 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Package events provides event subscription and polling functionality.
 package events
 
 import (
 	"errors"
-	stdsync "sync"
+	"runtime"
 	"time"
 
 	"github.com/syncthing/syncthing/lib/sync"
@@ -18,8 +18,7 @@ import (
 type EventType int
 
 const (
-	Ping EventType = 1 << iota
-	Starting
+	Starting EventType = 1 << iota
 	StartupComplete
 	DeviceDiscovered
 	DeviceConnected
@@ -28,6 +27,7 @@ const (
 	DevicePaused
 	DeviceResumed
 	LocalChangeDetected
+	RemoteChangeDetected
 	LocalIndexUpdated
 	RemoteIndexUpdated
 	ItemStarted
@@ -41,16 +41,20 @@ const (
 	FolderCompletion
 	FolderErrors
 	FolderScanProgress
+	FolderPaused
+	FolderResumed
 	ListenAddressesChanged
 	LoginAttempt
 
 	AllEvents = (1 << iota) - 1
 )
 
+var runningTests = false
+
+const eventLogTimeout = 15 * time.Millisecond
+
 func (t EventType) String() string {
 	switch t {
-	case Ping:
-		return "Ping"
 	case Starting:
 		return "Starting"
 	case StartupComplete:
@@ -65,6 +69,8 @@ func (t EventType) String() string {
 		return "DeviceRejected"
 	case LocalChangeDetected:
 		return "LocalChangeDetected"
+	case RemoteChangeDetected:
+		return "RemoteChangeDetected"
 	case LocalIndexUpdated:
 		return "LocalIndexUpdated"
 	case RemoteIndexUpdated:
@@ -95,6 +101,10 @@ func (t EventType) String() string {
 		return "DeviceResumed"
 	case FolderScanProgress:
 		return "FolderScanProgress"
+	case FolderPaused:
+		return "FolderPaused"
+	case FolderResumed:
+		return "FolderResumed"
 	case ListenAddressesChanged:
 		return "ListenAddressesChanged"
 	case LoginAttempt:
@@ -114,6 +124,7 @@ type Logger struct {
 	subs                []*Subscription
 	nextSubscriptionIDs []int
 	nextGlobalID        int
+	timeout             *time.Timer
 	mutex               sync.Mutex
 }
 
@@ -141,15 +152,22 @@ var (
 )
 
 func NewLogger() *Logger {
-	return &Logger{
-		mutex: sync.NewMutex(),
+	l := &Logger{
+		mutex:   sync.NewMutex(),
+		timeout: time.NewTimer(time.Second),
 	}
+	// Make sure the timer is in the stopped state and hasn't fired anything
+	// into the channel.
+	if !l.timeout.Stop() {
+		<-l.timeout.C
+	}
+	return l
 }
 
 func (l *Logger) Log(t EventType, data interface{}) {
 	l.mutex.Lock()
-	dl.Debugln("log", l.nextGlobalID, t, data)
 	l.nextGlobalID++
+	dl.Debugln("log", l.nextGlobalID, t, data)
 
 	e := Event{
 		GlobalID: l.nextGlobalID,
@@ -163,10 +181,21 @@ func (l *Logger) Log(t EventType, data interface{}) {
 			e.SubscriptionID = l.nextSubscriptionIDs[i]
 			l.nextSubscriptionIDs[i]++
 
+			l.timeout.Reset(eventLogTimeout)
+			timedOut := false
+
 			select {
 			case s.events <- e:
-			default:
+			case <-l.timeout.C:
 				// if s.events is not ready, drop the event
+				timedOut = true
+			}
+
+			// If stop returns false it already sent something to the
+			// channel. If we didn't already read it above we must do so now
+			// or we get a spurious timeout on the next loop.
+			if !l.timeout.Stop() && !timedOut {
+				<-l.timeout.C
 			}
 		}
 	}
@@ -186,6 +215,13 @@ func (l *Logger) Subscribe(mask EventType) *Subscription {
 	// We need to create the timeout timer in the stopped, non-fired state so
 	// that Subscription.Poll() can safely reset it and select on the timeout
 	// channel. This ensures the timer is stopped and the channel drained.
+	if runningTests {
+		// Make the behavior stable when running tests to avoid randomly
+		// varying test coverage. This ensures, in practice if not in
+		// theory, that the timer fires and we take the true branch of the
+		// next if.
+		runtime.Gosched()
+	}
 	if !s.timeout.Stop() {
 		<-s.timeout.C
 	}
@@ -231,6 +267,14 @@ func (s *Subscription) Poll(timeout time.Duration) (Event, error) {
 		if !ok {
 			return e, ErrClosed
 		}
+		if runningTests {
+			// Make the behavior stable when running tests to avoid randomly
+			// varying test coverage. This ensures, in practice if not in
+			// theory, that the timer fires and we take the true branch of
+			// the next if.
+			s.timeout.Reset(0)
+			runtime.Gosched()
+		}
 		if !s.timeout.Stop() {
 			// The timeout must be stopped and possibly drained to be ready
 			// for reuse in the next call.
@@ -252,11 +296,11 @@ type bufferedSubscription struct {
 	next int
 	cur  int // Current SubscriptionID
 	mut  sync.Mutex
-	cond *stdsync.Cond
+	cond *sync.TimeoutCond
 }
 
 type BufferedSubscription interface {
-	Since(id int, into []Event) []Event
+	Since(id int, into []Event, timeout time.Duration) []Event
 }
 
 func NewBufferedSubscription(s *Subscription, size int) BufferedSubscription {
@@ -265,24 +309,13 @@ func NewBufferedSubscription(s *Subscription, size int) BufferedSubscription {
 		buf: make([]Event, size),
 		mut: sync.NewMutex(),
 	}
-	bs.cond = stdsync.NewCond(bs.mut)
+	bs.cond = sync.NewTimeoutCond(bs.mut)
 	go bs.pollingLoop()
 	return bs
 }
 
 func (s *bufferedSubscription) pollingLoop() {
-	for {
-		ev, err := s.sub.Poll(60 * time.Second)
-		if err == ErrTimeout {
-			continue
-		}
-		if err == ErrClosed {
-			return
-		}
-		if err != nil {
-			panic("unexpected error: " + err.Error())
-		}
-
+	for ev := range s.sub.C() {
 		s.mut.Lock()
 		s.buf[s.next] = ev
 		s.next = (s.next + 1) % len(s.buf)
@@ -292,12 +325,21 @@ func (s *bufferedSubscription) pollingLoop() {
 	}
 }
 
-func (s *bufferedSubscription) Since(id int, into []Event) []Event {
+func (s *bufferedSubscription) Since(id int, into []Event, timeout time.Duration) []Event {
 	s.mut.Lock()
 	defer s.mut.Unlock()
 
-	for id >= s.cur {
-		s.cond.Wait()
+	// Check once first before generating the TimeoutCondWaiter
+	if id >= s.cur {
+		waiter := s.cond.SetupWait(timeout)
+		defer waiter.Stop()
+
+		for id >= s.cur {
+			if eventsAvailable := waiter.Wait(); !eventsAvailable {
+				// Timed out
+				return into
+			}
+		}
 	}
 
 	for i := s.next; i < len(s.buf); i++ {

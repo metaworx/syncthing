@@ -1,13 +1,7 @@
 stdiscosrv
 ==========
 
-[![Latest Build](http://img.shields.io/jenkins/s/http/build.syncthing.net/stdiscosrv.svg?style=flat-square)](http://build.syncthing.net/job/stdiscosrv/lastBuild/)
-
 This is the global discovery server for the `syncthing` project.
-
-To get it, run `go get github.com/syncthing/stdiscosrv` or download the
-[latest build](http://build.syncthing.net/job/stdiscosrv/lastSuccessfulBuild/artifact/)
-from the build server.
 
 Usage
 -----
@@ -38,3 +32,7 @@ In all cases, the appropriate tables and indexes will be created at first
 startup. If it doesn't exit with an error, you're fine.
 
 See `stdiscosrv -help` for other options.
+
+##### Third-party attribution
+
+[cznic/lldb](https://github.com/cznic/lldb), Copyright (C) 2014 The lldb Authors.

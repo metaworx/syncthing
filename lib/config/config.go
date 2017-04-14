@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Package config implements reading and writing of the syncthing configuration file.
 package config
@@ -13,50 +13,79 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net"
 	"net/url"
 	"os"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/upgrade"
 	"github.com/syncthing/syncthing/lib/util"
 )
 
 const (
 	OldestHandledVersion = 10
-	CurrentVersion       = 15
+	CurrentVersion       = 19
 	MaxRescanIntervalS   = 365 * 24 * 60 * 60
 )
 
 var (
+	// DefaultTCPPort defines default TCP port used if the URI does not specify one, for example tcp://0.0.0.0
+	DefaultTCPPort = 22000
+	// DefaultKCPPort defines default KCP (UDP) port used if the URI does not specify one, for example kcp://0.0.0.0
+	DefaultKCPPort = 22020
 	// DefaultListenAddresses should be substituted when the configuration
 	// contains <listenAddress>default</listenAddress>. This is done by the
 	// "consumer" of the configuration as we don't want these saved to the
 	// config.
 	DefaultListenAddresses = []string{
-		"tcp://0.0.0.0:22000",
+		util.Address("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(DefaultTCPPort))),
 		"dynamic+https://relays.syncthing.net/endpoint",
 	}
+	// DefaultKCPListenAddress gets added to the default listen address set
+	// when the appropriate feature flag is set. Feature flag stuff to be
+	// removed later.
+	DefaultKCPListenAddress = util.Address("kcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(DefaultKCPPort)))
 	// DefaultDiscoveryServersV4 should be substituted when the configuration
 	// contains <globalAnnounceServer>default-v4</globalAnnounceServer>.
 	DefaultDiscoveryServersV4 = []string{
-		"https://discovery-v4-1.syncthing.net/v2/?id=SR7AARM-TCBUZ5O-VFAXY4D-CECGSDE-3Q6IZ4G-XG7AH75-OBIXJQV-QJ6NLQA", // 194.126.249.5, Sweden
 		"https://discovery-v4-2.syncthing.net/v2/?id=DVU36WY-H3LVZHW-E6LLFRE-YAFN5EL-HILWRYP-OC2M47J-Z4PE62Y-ADIBDQC", // 45.55.230.38, USA
 		"https://discovery-v4-3.syncthing.net/v2/?id=VK6HNJ3-VVMM66S-HRVWSCR-IXEHL2H-U4AQ4MW-UCPQBWX-J2L2UBK-NVZRDQZ", // 128.199.95.124, Singapore
+		"https://discovery-v4-4.syncthing.net/v2/?id=LYXKCHX-VI3NYZR-ALCJBHF-WMZYSPK-QG6QJA3-MPFYMSO-U56GTUK-NA2MIAW", // 95.85.19.244, NL
 	}
 	// DefaultDiscoveryServersV6 should be substituted when the configuration
 	// contains <globalAnnounceServer>default-v6</globalAnnounceServer>.
 	DefaultDiscoveryServersV6 = []string{
-		"https://discovery-v6-1.syncthing.net/v2/?id=SR7AARM-TCBUZ5O-VFAXY4D-CECGSDE-3Q6IZ4G-XG7AH75-OBIXJQV-QJ6NLQA", // 2001:470:28:4d6::5, Sweden
 		"https://discovery-v6-2.syncthing.net/v2/?id=DVU36WY-H3LVZHW-E6LLFRE-YAFN5EL-HILWRYP-OC2M47J-Z4PE62Y-ADIBDQC", // 2604:a880:800:10::182:a001, USA
 		"https://discovery-v6-3.syncthing.net/v2/?id=VK6HNJ3-VVMM66S-HRVWSCR-IXEHL2H-U4AQ4MW-UCPQBWX-J2L2UBK-NVZRDQZ", // 2400:6180:0:d0::d9:d001, Singapore
+		"https://discovery-v6-4.syncthing.net/v2/?id=LYXKCHX-VI3NYZR-ALCJBHF-WMZYSPK-QG6QJA3-MPFYMSO-U56GTUK-NA2MIAW", // 2a03:b0c0:0:1010::4ed:3001, NL
 	}
 	// DefaultDiscoveryServers should be substituted when the configuration
 	// contains <globalAnnounceServer>default</globalAnnounceServer>.
 	DefaultDiscoveryServers = append(DefaultDiscoveryServersV4, DefaultDiscoveryServersV6...)
-
+	// DefaultStunServers should be substituted when the configuration
+	// contains <stunServer>default</stunServer>.
+	DefaultStunServers = []string{
+		"stun.callwithus.com:3478",
+		"stun.counterpath.com:3478",
+		"stun.counterpath.net:3478",
+		"stun.ekiga.net:3478",
+		"stun.ideasip.com:3478",
+		"stun.internetcalls.com:3478",
+		"stun.schlund.de:3478",
+		"stun.sipgate.net:10000",
+		"stun.sipgate.net:3478",
+		"stun.voip.aebc.com:3478",
+		"stun.voiparound.com:3478",
+		"stun.voipbuster.com:3478",
+		"stun.voipstunt.com:3478",
+		"stun.voxgratia.org:3478",
+		"stun.xten.com:3478",
+	}
 	// DefaultTheme is the default and fallback theme for the web UI.
 	DefaultTheme = "default"
 )
@@ -70,7 +99,10 @@ func New(myID protocol.DeviceID) Configuration {
 	util.SetDefaults(&cfg.Options)
 	util.SetDefaults(&cfg.GUI)
 
-	cfg.prepare(myID)
+	// Can't happen.
+	if err := cfg.prepare(myID); err != nil {
+		panic("bug: error in preparing new folder: " + err.Error())
+	}
 
 	return cfg
 }
@@ -105,7 +137,9 @@ func ReadJSON(r io.Reader, myID protocol.DeviceID) (Configuration, error) {
 		return Configuration{}, err
 	}
 
-	err = json.Unmarshal(bs, &cfg)
+	if err := json.Unmarshal(bs, &cfg); err != nil {
+		return Configuration{}, err
+	}
 	cfg.OriginalVersion = cfg.Version
 
 	if err := cfg.prepare(myID); err != nil {
@@ -162,6 +196,36 @@ func (cfg *Configuration) WriteXML(w io.Writer) error {
 }
 
 func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
+	var myName string
+
+	// Ensure this device is present in the config
+	for _, device := range cfg.Devices {
+		if device.DeviceID == myID {
+			goto found
+		}
+	}
+
+	myName, _ = os.Hostname()
+	cfg.Devices = append(cfg.Devices, DeviceConfiguration{
+		DeviceID: myID,
+		Name:     myName,
+	})
+
+found:
+
+	if err := cfg.clean(); err != nil {
+		return err
+	}
+
+	// Ensure that we are part of the devices
+	for i := range cfg.Folders {
+		cfg.Folders[i].Devices = ensureDevicePresent(cfg.Folders[i].Devices, myID)
+	}
+
+	return nil
+}
+
+func (cfg *Configuration) clean() error {
 	util.FillNilSlices(&cfg.Options)
 
 	// Initialize any empty slices
@@ -173,6 +237,9 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
 	}
 	if cfg.Options.AlwaysLocalNets == nil {
 		cfg.Options.AlwaysLocalNets = []string{}
+	}
+	if cfg.Options.UnackedNotificationIDs == nil {
+		cfg.Options.UnackedNotificationIDs = []string{}
 	}
 
 	// Prepare folders and check for duplicates. Duplicates are bad and
@@ -213,21 +280,23 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
 	if cfg.Version == 14 {
 		convertV14V15(cfg)
 	}
+	if cfg.Version == 15 {
+		convertV15V16(cfg)
+	}
+	if cfg.Version == 16 {
+		convertV16V17(cfg)
+	}
+	if cfg.Version == 17 {
+		convertV17V18(cfg)
+	}
+	if cfg.Version == 18 {
+		convertV18V19(cfg)
+	}
 
 	// Build a list of available devices
 	existingDevices := make(map[protocol.DeviceID]bool)
 	for _, device := range cfg.Devices {
 		existingDevices[device.DeviceID] = true
-	}
-
-	// Ensure this device is present in the config
-	if !existingDevices[myID] {
-		myName, _ := os.Hostname()
-		cfg.Devices = append(cfg.Devices, DeviceConfiguration{
-			DeviceID: myID,
-			Name:     myName,
-		})
-		existingDevices[myID] = true
 	}
 
 	// Ensure that the device list is free from duplicates
@@ -236,10 +305,8 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
 	sort.Sort(DeviceConfigurationList(cfg.Devices))
 	// Ensure that any loose devices are not present in the wrong places
 	// Ensure that there are no duplicate devices
-	// Ensure that puller settings are sane
 	// Ensure that the versioning configuration parameter map is not nil
 	for i := range cfg.Folders {
-		cfg.Folders[i].Devices = ensureDevicePresent(cfg.Folders[i].Devices, myID)
 		cfg.Folders[i].Devices = ensureExistingDevices(cfg.Folders[i].Devices, existingDevices)
 		cfg.Folders[i].Devices = ensureNoDuplicateFolderDevices(cfg.Folders[i].Devices)
 		if cfg.Folders[i].Versioning.Params == nil {
@@ -265,7 +332,53 @@ func (cfg *Configuration) prepare(myID protocol.DeviceID) error {
 		cfg.GUI.APIKey = rand.String(32)
 	}
 
+	// The list of ignored devices should not contain any devices that have
+	// been manually added to the config.
+	newIgnoredDevices := []protocol.DeviceID{}
+	for _, dev := range cfg.IgnoredDevices {
+		if !existingDevices[dev] {
+			newIgnoredDevices = append(newIgnoredDevices, dev)
+		}
+	}
+	cfg.IgnoredDevices = newIgnoredDevices
+
 	return nil
+}
+
+func convertV18V19(cfg *Configuration) {
+	// Triggers a database tweak
+	cfg.Version = 19
+}
+
+func convertV17V18(cfg *Configuration) {
+	// Do channel selection for existing users. Those who have auto upgrades
+	// and usage reporting on default to the candidate channel. Others get
+	// stable.
+	if cfg.Options.URAccepted > 0 && cfg.Options.AutoUpgradeIntervalH > 0 {
+		cfg.Options.UpgradeToPreReleases = true
+	}
+
+	// Show a notification to explain what's going on, except if upgrades
+	// are disabled by compilation or environment variable in which case
+	// it's not relevant.
+	if !upgrade.DisabledByCompilation && os.Getenv("STNOUPGRADE") == "" {
+		cfg.Options.UnackedNotificationIDs = append(cfg.Options.UnackedNotificationIDs, "channelNotification")
+	}
+
+	cfg.Version = 18
+}
+
+func convertV16V17(cfg *Configuration) {
+	for i := range cfg.Folders {
+		cfg.Folders[i].Fsync = true
+	}
+
+	cfg.Version = 17
+}
+
+func convertV15V16(cfg *Configuration) {
+	// Triggers a database tweak
+	cfg.Version = 16
 }
 
 func convertV14V15(cfg *Configuration) {
@@ -352,9 +465,9 @@ func convertV13V14(cfg *Configuration) {
 
 	for i, fcfg := range cfg.Folders {
 		if fcfg.DeprecatedReadOnly {
-			cfg.Folders[i].Type = FolderTypeReadOnly
+			cfg.Folders[i].Type = FolderTypeSendOnly
 		} else {
-			cfg.Folders[i].Type = FolderTypeReadWrite
+			cfg.Folders[i].Type = FolderTypeSendReceive
 		}
 		cfg.Folders[i].DeprecatedReadOnly = false
 	}

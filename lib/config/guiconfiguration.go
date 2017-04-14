@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package config
 
@@ -13,14 +13,16 @@ import (
 )
 
 type GUIConfiguration struct {
-	Enabled             bool   `xml:"enabled,attr" json:"enabled" default:"true"`
-	RawAddress          string `xml:"address" json:"address" default:"127.0.0.1:8384"`
-	User                string `xml:"user,omitempty" json:"user"`
-	Password            string `xml:"password,omitempty" json:"password"`
-	RawUseTLS           bool   `xml:"tls,attr" json:"useTLS"`
-	APIKey              string `xml:"apikey,omitempty" json:"apiKey"`
-	InsecureAdminAccess bool   `xml:"insecureAdminAccess,omitempty" json:"insecureAdminAccess"`
-	Theme               string `xml:"theme" json:"theme" default:"default"`
+	Enabled               bool   `xml:"enabled,attr" json:"enabled" default:"true"`
+	RawAddress            string `xml:"address" json:"address" default:"127.0.0.1:8384"`
+	User                  string `xml:"user,omitempty" json:"user"`
+	Password              string `xml:"password,omitempty" json:"password"`
+	RawUseTLS             bool   `xml:"tls,attr" json:"useTLS"`
+	APIKey                string `xml:"apikey,omitempty" json:"apiKey"`
+	InsecureAdminAccess   bool   `xml:"insecureAdminAccess,omitempty" json:"insecureAdminAccess"`
+	Theme                 string `xml:"theme" json:"theme" default:"default"`
+	Debugging             bool   `xml:"debugging,attr" json:"debugging"`
+	InsecureSkipHostCheck bool   `xml:"insecureSkipHostcheck,omitempty" json:"insecureSkipHostcheck"`
 }
 
 func (c GUIConfiguration) Address() string {

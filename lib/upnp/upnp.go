@@ -108,19 +108,21 @@ func Discover(renewal, timeout time.Duration) []nat.Device {
 		close(resultChan)
 	}()
 
+	seenResults := make(map[string]bool)
 nextResult:
 	for result := range resultChan {
-		for _, existingResult := range results {
-			if existingResult.ID() == result.ID() {
-				l.Debugf("Skipping duplicate result %s with services:", result.uuid)
-				for _, service := range result.services {
-					l.Debugf("* [%s] %s", service.ID, service.URL)
-				}
-				continue nextResult
+		if seenResults[result.ID()] {
+			l.Debugf("Skipping duplicate result %s with services:", result.uuid)
+			for _, service := range result.services {
+				l.Debugf("* [%s] %s", service.ID, service.URL)
 			}
+			continue nextResult
 		}
 
+		result := result // Reallocate as we need to keep a pointer
 		results = append(results, &result)
+		seenResults[result.ID()] = true
+
 		l.Debugf("UPnP discovery result %s with services:", result.uuid)
 		for _, service := range result.services {
 			l.Debugf("* [%s] %s", service.ID, service.URL)
@@ -224,7 +226,7 @@ func parseResponse(deviceType string, resp []byte) (IGD, error) {
 	}
 
 	deviceUUID := strings.TrimPrefix(strings.Split(deviceUSN, "::")[0], "uuid:")
-	matched, err := regexp.MatchString("[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}", deviceUUID)
+	matched, _ := regexp.MatchString("[a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12}", deviceUUID)
 	if !matched {
 		l.Infoln("Invalid IGD response: invalid device UUID", deviceUUID, "(continuing anyway)")
 	}

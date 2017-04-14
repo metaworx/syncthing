@@ -2,11 +2,12 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -38,6 +39,9 @@ type FolderConfiguration struct {
 	MaxConflicts          int                         `xml:"maxConflicts" json:"maxConflicts"`
 	DisableSparseFiles    bool                        `xml:"disableSparseFiles" json:"disableSparseFiles"`
 	DisableTempIndexes    bool                        `xml:"disableTempIndexes" json:"disableTempIndexes"`
+	Fsync                 bool                        `xml:"fsync" json:"fsync"`
+	Paused                bool                        `xml:"paused" json:"paused"`
+	WeakHashThresholdPct  int                         `xml:"weakHashThresholdPct" json:"weakHashThresholdPct"` // Use weak hash if more than X percent of the file has changed. Set to -1 to always use weak hash.
 	FollowSymlinks        []string                    `xml:"followSymlink" json:"followSymlinks"`
 
 	cachedPath string
@@ -46,7 +50,8 @@ type FolderConfiguration struct {
 }
 
 type FolderDeviceConfiguration struct {
-	DeviceID protocol.DeviceID `xml:"id,attr" json:"deviceID"`
+	DeviceID     protocol.DeviceID `xml:"id,attr" json:"deviceID"`
+	IntroducedBy protocol.DeviceID `xml:"introducedBy,attr" json:"introducedBy"`
 }
 
 func NewFolderConfiguration(id, path string) FolderConfiguration {
@@ -85,6 +90,9 @@ func (f *FolderConfiguration) CreateMarker() error {
 			return err
 		}
 		fd.Close()
+		if err := osutil.SyncDir(filepath.Dir(marker)); err != nil {
+			l.Infof("fsync %q failed: %v", filepath.Dir(marker), err)
+		}
 		osutil.HideFile(marker)
 	}
 
@@ -93,10 +101,14 @@ func (f *FolderConfiguration) CreateMarker() error {
 
 func (f *FolderConfiguration) HasMarker() bool {
 	_, err := os.Stat(filepath.Join(f.Path(), ".stfolder"))
-	if err != nil {
-		return false
+	return err == nil
+}
+
+func (f FolderConfiguration) Description() string {
+	if f.Label == "" {
+		return f.ID
 	}
-	return true
+	return fmt.Sprintf("%q (%s)", f.Label, f.ID)
 }
 
 func (f *FolderConfiguration) DeviceIDs() []protocol.DeviceID {
@@ -134,6 +146,10 @@ func (f *FolderConfiguration) prepare() {
 
 	if f.Versioning.Params == nil {
 		f.Versioning.Params = make(map[string]string)
+	}
+
+	if f.WeakHashThresholdPct == 0 {
+		f.WeakHashThresholdPct = 25
 	}
 }
 

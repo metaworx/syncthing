@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // +build ignore
 
@@ -35,6 +35,8 @@ func main() {
 	if err := formatProto(in, out); err != nil {
 		log.Fatal(err)
 	}
+	in.Close()
+	out.Close()
 	if err := os.Rename(file+".tmp", file); err != nil {
 		log.Fatal(err)
 	}

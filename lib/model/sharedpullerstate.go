@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package model
 
@@ -31,30 +31,32 @@ type sharedPullerState struct {
 	created     time.Time
 
 	// Mutable, must be locked for access
-	err              error        // The first error we hit
-	fd               *os.File     // The fd of the temp file
-	copyTotal        int          // Total number of copy actions for the whole job
-	pullTotal        int          // Total number of pull actions for the whole job
-	copyOrigin       int          // Number of blocks copied from the original file
-	copyNeeded       int          // Number of copy actions still pending
-	pullNeeded       int          // Number of block pulls still pending
-	updated          time.Time    // Time when any of the counters above were last updated
-	closed           bool         // True if the file has been finalClosed.
-	available        []int32      // Indexes of the blocks that are available in the temporary file
-	availableUpdated time.Time    // Time when list of available blocks was last updated
-	mut              sync.RWMutex // Protects the above
+	err               error        // The first error we hit
+	fd                *os.File     // The fd of the temp file
+	copyTotal         int          // Total number of copy actions for the whole job
+	pullTotal         int          // Total number of pull actions for the whole job
+	copyOrigin        int          // Number of blocks copied from the original file
+	copyOriginShifted int          // Number of blocks copied from the original file but shifted
+	copyNeeded        int          // Number of copy actions still pending
+	pullNeeded        int          // Number of block pulls still pending
+	updated           time.Time    // Time when any of the counters above were last updated
+	closed            bool         // True if the file has been finalClosed.
+	available         []int32      // Indexes of the blocks that are available in the temporary file
+	availableUpdated  time.Time    // Time when list of available blocks was last updated
+	mut               sync.RWMutex // Protects the above
 }
 
 // A momentary state representing the progress of the puller
 type pullerProgress struct {
-	Total               int   `json:"total"`
-	Reused              int   `json:"reused"`
-	CopiedFromOrigin    int   `json:"copiedFromOrigin"`
-	CopiedFromElsewhere int   `json:"copiedFromElsewhere"`
-	Pulled              int   `json:"pulled"`
-	Pulling             int   `json:"pulling"`
-	BytesDone           int64 `json:"bytesDone"`
-	BytesTotal          int64 `json:"bytesTotal"`
+	Total                   int   `json:"total"`
+	Reused                  int   `json:"reused"`
+	CopiedFromOrigin        int   `json:"copiedFromOrigin"`
+	CopiedFromOriginShifted int   `json:"copiedFromOriginShifted"`
+	CopiedFromElsewhere     int   `json:"copiedFromElsewhere"`
+	Pulled                  int   `json:"pulled"`
+	Pulling                 int   `json:"pulling"`
+	BytesDone               int64 `json:"bytesDone"`
+	BytesTotal              int64 `json:"bytesTotal"`
 }
 
 // A lockedWriterAt synchronizes WriteAt calls with an external mutex.
@@ -121,24 +123,40 @@ func (s *sharedPullerState) tempFile() (io.WriterAt, error) {
 		}
 	}
 
+	// The permissions to use for the temporary file should be those of the
+	// final file, except we need user read & write at minimum. The
+	// permissions will be set to the final value later, but in the meantime
+	// we don't want to have a temporary file with looser permissions than
+	// the final outcome.
+	mode := os.FileMode(s.file.Permissions) | 0600
+	if s.ignorePerms {
+		// When ignorePerms is set we use a very permissive mode and let the
+		// system umask filter it.
+		mode = 0666
+	}
+
 	// Attempt to create the temp file
 	// RDWR because of issue #2994.
 	flags := os.O_RDWR
 	if s.reused == 0 {
 		flags |= os.O_CREATE | os.O_EXCL
-	} else {
+	} else if !s.ignorePerms {
 		// With sufficiently bad luck when exiting or crashing, we may have
 		// had time to chmod the temp file to read only state but not yet
 		// moved it to it's final name. This leaves us with a read only temp
 		// file that we're going to try to reuse. To handle that, we need to
 		// make sure we have write permissions on the file before opening it.
-		err := os.Chmod(s.tempName, 0644)
-		if !s.ignorePerms && err != nil {
+		//
+		// When ignorePerms is set we trust that the permissions are fine
+		// already and make no modification, as we would otherwise override
+		// what the umask dictates.
+
+		if err := os.Chmod(s.tempName, mode); err != nil {
 			s.failLocked("dst create chmod", err)
 			return nil, err
 		}
 	}
-	fd, err := os.OpenFile(s.tempName, flags, 0666)
+	fd, err := os.OpenFile(s.tempName, flags, mode)
 	if err != nil {
 		s.failLocked("dst create", err)
 		return nil, err
@@ -221,6 +239,14 @@ func (s *sharedPullerState) copyDone(block protocol.BlockInfo) {
 func (s *sharedPullerState) copiedFromOrigin() {
 	s.mut.Lock()
 	s.copyOrigin++
+	s.updated = time.Now()
+	s.mut.Unlock()
+}
+
+func (s *sharedPullerState) copiedFromOriginShifted() {
+	s.mut.Lock()
+	s.copyOrigin++
+	s.copyOriginShifted++
 	s.updated = time.Now()
 	s.mut.Unlock()
 }

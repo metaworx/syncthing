@@ -104,13 +104,18 @@ case "${1:-default}" in
 		# For every package in the repo
 		for dir in $(go list ./lib/... ./cmd/...) ; do
 			# run the tests
-			GOPATH="$(pwd)/Godeps/_workspace:$GOPATH" go test -race -coverprofile=profile.out $dir
+			GOPATH="$(pwd)/Godeps/_workspace:$GOPATH" go test -coverprofile=profile.out $dir
 			if [ -f profile.out ] ; then
 				# and if there was test output, append it to coverage.out
 				grep -v "mode: " profile.out >> coverage.out
 				rm profile.out
 			fi
 		done
+
+		notCovered=$(egrep -c '\s0$' coverage.out)
+		total=$(wc -l coverage.out | awk '{print $1}')
+		coverPct=$(awk "BEGIN{print (1 - $notCovered / $total) * 100}")
+		echo "Total coverage is $coverPct%"
 
 		gocov convert coverage.out | gocov-xml > coverage.xml
 
@@ -129,55 +134,6 @@ case "${1:-default}" in
 
 		(GOPATH="$(pwd)/Godeps/_workspace:$GOPATH" go test -v -race ./lib/... ./cmd/... || true) > tests.out
 		go2xunit -output tests.xml -fail < tests.out
-		;;
-
-	docker-all)
-		img=${DOCKERIMG:-syncthing/build:latest}
-		docker run --rm -h syncthing-builder -u $(id -u) -t \
-			-v $(pwd):/go/src/github.com/syncthing/syncthing \
-			-w /go/src/github.com/syncthing/syncthing \
-			-e "STTRACE=$STTRACE" \
-			"$img" \
-			sh -c './build.sh clean \
-				&& ./build.sh test-cov \
-				&& ./build.sh bench \
-				&& ./build.sh all'
-		;;
-
-	docker-test)
-		img=${DOCKERIMG:-syncthing/build:latest}
-		docker run --rm -h syncthing-builder -u $(id -u) -t \
-			-v $(pwd):/go/src/github.com/syncthing/syncthing \
-			-w /go/src/github.com/syncthing/syncthing \
-			-e "STTRACE=$STTRACE" \
-			"$img" \
-			sh -euxc './build.sh clean \
-				&& go run build.go -race \
-				&& export GOPATH=$(pwd)/Godeps/_workspace:$GOPATH \
-				&& cd test \
-				&& go test -tags integration -v -timeout 90m -short \
-				&& git clean -fxd .'
-		;;
-
-	docker-lint)
-		img=${DOCKERIMG:-syncthing/build:latest}
-		docker run --rm -h syncthing-builder -u $(id -u) -t \
-			-v $(pwd):/go/src/github.com/syncthing/syncthing \
-			-w /go/src/github.com/syncthing/syncthing \
-			-e "STTRACE=$STTRACE" \
-			"$img" \
-			sh -euxc 'go run build.go lint'
-		;;
-
-
-	docker-vet)
-		img=${DOCKERIMG:-syncthing/build:latest}
-		docker run --rm -h syncthing-builder -u $(id -u) -t \
-			-v $(pwd):/go/src/github.com/syncthing/syncthing \
-			-w /go/src/github.com/syncthing/syncthing \
-			-e "STTRACE=$STTRACE" \
-			"$img" \
-			sh -euxc 'go run build.go vet'
 		;;
 
 	*)

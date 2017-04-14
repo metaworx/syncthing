@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -12,11 +12,11 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
-	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"os/signal"
@@ -42,11 +42,14 @@ import (
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/rand"
-	"github.com/syncthing/syncthing/lib/symlinks"
+	"github.com/syncthing/syncthing/lib/sha256"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/upgrade"
+	"github.com/syncthing/syncthing/lib/weakhash"
 
 	"github.com/thejerf/suture"
+
+	_ "net/http/pprof" // Need to import this to support STPROFILER.
 )
 
 var (
@@ -57,8 +60,10 @@ var (
 	BuildHost         = "unknown"
 	BuildUser         = "unknown"
 	IsRelease         bool
+	IsCandidate       bool
 	IsBeta            bool
 	LongVersion       string
+	BuildTags         []string
 	allowedVersionExp = regexp.MustCompile(`^v\d+\.\d+\.\d+(-[a-z0-9]+)*(\.\d+)*(\+\d+-g[0-9a-f]+)?(-[^\s]+)?$`)
 )
 
@@ -75,7 +80,7 @@ const (
 	tlsDefaultCommonName = "syncthing"
 	httpsRSABits         = 2048
 	bepRSABits           = 0 // 384 bit ECDSA used instead
-	pingEventInterval    = time.Minute
+	defaultEventTimeout  = time.Minute
 	maxSystemErrors      = 5
 	initialSystemLog     = 10
 	maxSystemLog         = 250
@@ -95,15 +100,26 @@ func init() {
 			l.Fatalf("Invalid version string %q;\n\tdoes not match regexp %v", Version, allowedVersionExp)
 		}
 	}
+}
 
-	// Check for a clean release build. A release is something like "v0.1.2",
-	// with an optional suffix of letters and dot separated numbers like
-	// "-beta3.47". If there's more stuff, like a plus sign and a commit hash
-	// and so on, then it's not a release. If there's a dash anywhere in
-	// there, it's some kind of beta or prerelease version.
+func setBuildMetadata() {
+	// Check for a clean release build. A release is something like
+	// "v0.1.2", with an optional suffix of letters and dot separated
+	// numbers like "-beta3.47". If there's more stuff, like a plus sign and
+	// a commit hash and so on, then it's not a release. If it has a dash in
+	// it, it's some sort of beta, release candidate or special build. If it
+	// has "-rc." in it, like "v0.14.35-rc.42", then it's a candidate build.
+	//
+	// So, every build that is not a stable release build has IsBeta = true.
+	// This is used to enable some extra debugging (the deadlock detector).
+	//
+	// Release candidate builds are also "betas" from this point of view and
+	// will have that debugging enabled. In addition, some features are
+	// forced for release candidates - auto upgrade, and usage reporting.
 
 	exp := regexp.MustCompile(`^v\d+\.\d+\.\d+(-[a-z]+[\d\.]+)?$`)
 	IsRelease = exp.MatchString(Version)
+	IsCandidate = strings.Contains(Version, "-rc.")
 	IsBeta = strings.Contains(Version, "-")
 
 	stamp, _ := strconv.Atoi(BuildStamp)
@@ -111,6 +127,10 @@ func init() {
 
 	date := BuildDate.UTC().Format("2006-01-02 15:04:05 MST")
 	LongVersion = fmt.Sprintf(`syncthing %s "%s" (%s %s-%s) %s@%s %s`, Version, Codename, runtime.Version(), runtime.GOOS, runtime.GOARCH, BuildUser, BuildHost, date)
+
+	if len(BuildTags) > 0 {
+		LongVersion = fmt.Sprintf("%s [%s]", LongVersion, strings.Join(BuildTags, ", "))
+	}
 }
 
 var (
@@ -138,11 +158,11 @@ show time only (2).
 Development Settings
 --------------------
 
-The following environment variables modify syncthing's behavior in ways that
+The following environment variables modify Syncthing's behavior in ways that
 are mostly useful for developers. Use with care.
 
  STNODEFAULTFOLDER Don't create a default folder when starting for the first
-                   time.  This variable will be ignored anytime after the first
+                   time. This variable will be ignored anytime after the first
                    run.
 
  STGUIASSETS       Directory to load GUI assets from. Overrides compiled in
@@ -151,8 +171,8 @@ are mostly useful for developers. Use with care.
  STTRACE           A comma separated string of facilities to trace. The valid
                    facility strings listed below.
 
- STPROFILER        Set to a listen address such as "127.0.0.1:9090" to start the
-                   profiler with HTTP access.
+ STPROFILER        Set to a listen address such as "127.0.0.1:9090" to start
+                   the profiler with HTTP access.
 
  STCPUPROFILE      Write a CPU profile to cpu-$pid.pprof on exit.
 
@@ -165,14 +185,33 @@ are mostly useful for developers. Use with care.
  STPERFSTATS       Write running performance statistics to perf-$pid.csv. Not
                    supported on Windows.
 
+ STDEADLOCK        Used for debugging internal deadlocks. Use only under
+                   direction of a developer.
+
+ STDEADLOCKTIMEOUT Used for debugging internal deadlocks; sets debug
+                   sensitivity. Use only under direction of a developer.
+
+ STDEADLOCKTHRESHOLD Used for debugging internal deadlocks; sets debug
+                     sensitivity.  Use only under direction of a developer.
+
+ STNORESTART       Equivalent to the -no-restart argument. Disable the
+                   Syncthing monitor process which handles restarts for some
+                   configuration changes, upgrades, crashes and also log file
+                   writing (stdout is still written).
+
  STNOUPGRADE       Disable automatic upgrades.
+
+ STHASHING         Select the SHA256 hashing package to use. Possible values
+                   are "standard" for the Go standard library implementation,
+                   "minio" for the github.com/minio/sha256-simd implementation,
+                   and blank (the default) for auto detection.
 
  GOMAXPROCS        Set the maximum number of CPU cores to use. Defaults to all
                    available CPU cores.
 
  GOGC              Percentage of heap growth at which to trigger GC. Default is
                    100. Lower numbers keep peak memory usage down, at the price
-                   of CPU usage (ie. performance).
+                   of CPU usage (i.e. performance).
 
 
 Debugging Facilities
@@ -185,14 +224,15 @@ The following are valid values for the STTRACE variable:
 
 // Environment options
 var (
-	noUpgrade       = os.Getenv("STNOUPGRADE") != ""
-	innerProcess    = os.Getenv("STNORESTART") != "" || os.Getenv("STMONITORED") != ""
-	noDefaultFolder = os.Getenv("STNODEFAULTFOLDER") != ""
+	noUpgradeFromEnv = os.Getenv("STNOUPGRADE") != ""
+	innerProcess     = os.Getenv("STNORESTART") != "" || os.Getenv("STMONITORED") != ""
+	noDefaultFolder  = os.Getenv("STNODEFAULTFOLDER") != ""
 )
 
 type RuntimeOptions struct {
 	confDir        string
-	reset          bool
+	resetDatabase  bool
+	resetDeltaIdxs bool
 	showVersion    bool
 	showPaths      bool
 	doUpgrade      bool
@@ -203,8 +243,10 @@ type RuntimeOptions struct {
 	hideConsole    bool
 	logFile        string
 	auditEnabled   bool
+	auditFile      string
 	verbose        bool
 	paused         bool
+	unpaused       bool
 	guiAddress     string
 	guiAPIKey      string
 	generateDir    string
@@ -251,8 +293,9 @@ func parseCommandLineOptions() RuntimeOptions {
 	flag.IntVar(&options.logFlags, "logflags", options.logFlags, "Select information in log line prefix (see below)")
 	flag.BoolVar(&options.noBrowser, "no-browser", false, "Do not start browser")
 	flag.BoolVar(&options.browserOnly, "browser-only", false, "Open GUI in browser")
-	flag.BoolVar(&options.noRestart, "no-restart", options.noRestart, "Do not restart; just exit")
-	flag.BoolVar(&options.reset, "reset", false, "Reset the database")
+	flag.BoolVar(&options.noRestart, "no-restart", options.noRestart, "Disable monitor process, managed restarts and log file writing")
+	flag.BoolVar(&options.resetDatabase, "reset-database", false, "Reset the database, forcing a full rescan and resync")
+	flag.BoolVar(&options.resetDeltaIdxs, "reset-deltas", false, "Reset delta index IDs, forcing a full index exchange")
 	flag.BoolVar(&options.doUpgrade, "upgrade", false, "Perform upgrade")
 	flag.BoolVar(&options.doUpgradeCheck, "upgrade-check", false, "Check for available upgrade")
 	flag.BoolVar(&options.showVersion, "version", false, "Show version")
@@ -260,8 +303,10 @@ func parseCommandLineOptions() RuntimeOptions {
 	flag.StringVar(&options.upgradeTo, "upgrade-to", options.upgradeTo, "Force upgrade directly from specified URL")
 	flag.BoolVar(&options.auditEnabled, "audit", false, "Write events to audit file")
 	flag.BoolVar(&options.verbose, "verbose", false, "Print verbose log output")
-	flag.BoolVar(&options.paused, "paused", false, "Start with all devices paused")
+	flag.BoolVar(&options.paused, "paused", false, "Start with all devices and folders paused")
+	flag.BoolVar(&options.unpaused, "unpaused", false, "Start with all devices and folders unpaused")
 	flag.StringVar(&options.logFile, "logfile", options.logFile, "Log file name (use \"-\" for stdout)")
+	flag.StringVar(&options.auditFile, "auditfile", options.auditFile, "Specify audit file (use \"-\" for stdout, \"--\" for stderr)")
 	if runtime.GOOS == "windows" {
 		// Allow user to hide the console window
 		flag.BoolVar(&options.hideConsole, "no-console", false, "Hide console window")
@@ -271,10 +316,17 @@ func parseCommandLineOptions() RuntimeOptions {
 	flag.Usage = usageFor(flag.CommandLine, usage, longUsage)
 	flag.Parse()
 
+	if len(flag.Args()) > 0 {
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	return options
 }
 
 func main() {
+	setBuildMetadata()
+
 	options := parseCommandLineOptions()
 	l.SetFlags(options.logFlags)
 
@@ -287,12 +339,27 @@ func main() {
 		os.Setenv("STGUIAPIKEY", options.guiAPIKey)
 	}
 
+	// Check for options which are not compatible with each other. We have
+	// to check logfile before it's set to the default below - we only want
+	// to complain if they set -logfile explicitly, not if it's set to its
+	// default location
+	if options.noRestart && (options.logFile != "" && options.logFile != "-") {
+		l.Fatalln("-logfile may not be used with -no-restart or STNORESTART")
+	}
+
 	if options.hideConsole {
 		osutil.HideConsole()
 	}
 
 	if options.confDir != "" {
 		// Not set as default above because the string can be really long.
+		if !filepath.IsAbs(options.confDir) {
+			var err error
+			options.confDir, err = filepath.Abs(options.confDir)
+			if err != nil {
+				l.Fatalln(err)
+			}
+		}
 		baseDirs["config"] = options.confDir
 	}
 
@@ -355,12 +422,40 @@ func main() {
 		return
 	}
 
-	if options.reset {
+	if options.resetDatabase {
 		resetDB()
 		return
 	}
 
-	if options.noRestart {
+	// ---BEGIN TEMPORARY HACK---
+	//
+	// Remove once v0.14.21-v0.14.22 are rare enough. Those versions,
+	// essentially:
+	//
+	// 1. os.Setenv("STMONITORED", "yes")
+	// 2. os.Setenv("STNORESTART", "")
+	//
+	// where the intention was for 2 to cancel out 1 instead of setting
+	// STNORESTART to the empty value. We check for exactly this combination
+	// and pretend that neither was set. Looking through os.Environ lets us
+	// distinguish. Luckily, we weren't smart enough to use os.Unsetenv.
+
+	matches := 0
+	for _, str := range os.Environ() {
+		if str == "STNORESTART=" {
+			matches++
+		}
+		if str == "STMONITORED=yes" {
+			matches++
+		}
+	}
+	if matches == 2 {
+		innerProcess = false
+	}
+
+	// ---END TEMPORARY HACK---
+
+	if innerProcess || options.noRestart {
 		syncthingMain(options)
 	} else {
 		monitorMain(options)
@@ -440,8 +535,8 @@ func debugFacilities() string {
 
 func checkUpgrade() upgrade.Release {
 	cfg, _ := loadConfig()
-	releasesURL := cfg.Options().ReleasesURL
-	release, err := upgrade.LatestRelease(releasesURL, Version)
+	opts := cfg.Options()
+	release, err := upgrade.LatestRelease(opts.ReleasesURL, Version, opts.UpgradeToPreReleases)
 	if err != nil {
 		l.Fatalln("Upgrade:", err)
 	}
@@ -529,7 +624,7 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 	l.SetPrefix("[start] ")
 
 	if runtimeOptions.auditEnabled {
-		startAuditing(mainService)
+		startAuditing(mainService, runtimeOptions.auditFile)
 	}
 
 	if runtimeOptions.verbose {
@@ -539,9 +634,11 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 	errors := logger.NewRecorder(l, logger.LevelWarn, maxSystemErrors, 0)
 	systemLog := logger.NewRecorder(l, logger.LevelDebug, maxSystemLog, initialSystemLog)
 
-	// Event subscription for the API; must start early to catch the early events.  The LocalChangeDetected
-	// event might overwhelm the event reciever in some situations so we will not subscribe to it here.
-	apiSub := events.NewBufferedSubscription(events.Default.Subscribe(events.AllEvents&^events.LocalChangeDetected), 1000)
+	// Event subscription for the API; must start early to catch the early
+	// events. The LocalChangeDetected event might overwhelm the event
+	// receiver in some situations so we will not subscribe to it here.
+	apiSub := events.NewBufferedSubscription(events.Default.Subscribe(events.AllEvents&^events.LocalChangeDetected&^events.RemoteChangeDetected), 1000)
+	diskSub := events.NewBufferedSubscription(events.Default.Subscribe(events.LocalChangeDetected|events.RemoteChangeDetected), 1000)
 
 	if len(os.Getenv("GOMAXPROCS")) == 0 {
 		runtime.GOMAXPROCS(runtime.NumCPU())
@@ -552,7 +649,7 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 	// report the error if there is one.
 	osutil.MaximizeOpenFileLimit()
 
-	// Ensure that that we have a certificate and key.
+	// Ensure that we have a certificate and key.
 	cert, err := tls.LoadX509KeyPair(locations[locCertFile], locations[locKeyFile])
 	if err != nil {
 		l.Infof("Generating ECDSA key and certificate for %s...", tlsDefaultCommonName)
@@ -567,7 +664,13 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 
 	l.Infoln(LongVersion)
 	l.Infoln("My ID:", myID)
-	printHashRate()
+
+	sha256.SelectAlgo()
+	sha256.Report()
+	perfWithWeakHash := cpuBench(3, 150*time.Millisecond, true)
+	l.Infof("Hashing performance with weak hash is %.02f MB/s", perfWithWeakHash)
+	perfWithoutWeakHash := cpuBench(3, 150*time.Millisecond, false)
+	l.Infof("Hashing performance without weak hash is %.02f MB/s", perfWithoutWeakHash)
 
 	// Emit the Starting event, now that we know who we are.
 
@@ -604,6 +707,10 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		InsecureSkipVerify:     true,
 		MinVersion:             tls.VersionTLS12,
 		CipherSuites: []uint16{
+			0xCCA8, // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305, Go 1.8
+			0xCCA9, // TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305, Go 1.8
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
@@ -613,13 +720,22 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		},
 	}
 
-	// If the read or write rate should be limited, set up a rate limiter for it.
-	// This will be used on connections created in the connect and listen routines.
-
 	opts := cfg.Options()
 
-	if !opts.SymlinksEnabled {
-		symlinks.Supported = false
+	if opts.WeakHashSelectionMethod == config.WeakHashAuto {
+		if perfWithoutWeakHash*0.8 > perfWithWeakHash {
+			l.Infof("Weak hash disabled, as it has an unacceptable performance impact.")
+			weakhash.Enabled = false
+		} else {
+			l.Infof("Weak hash enabled, as it has an acceptable performance impact.")
+			weakhash.Enabled = true
+		}
+	} else if opts.WeakHashSelectionMethod == config.WeakHashNever {
+		l.Infof("Disabling weak hash")
+		weakhash.Enabled = false
+	} else if opts.WeakHashSelectionMethod == config.WeakHashAlways {
+		l.Infof("Enabling weak hash")
+		weakhash.Enabled = true
 	}
 
 	if (opts.MaxRecvKbps > 0 || opts.MaxSendKbps > 0) && !opts.LimitBandwidthInLan {
@@ -647,6 +763,11 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		l.Fatalln("Cannot open database:", err, "- Is another copy of Syncthing already running?")
 	}
 
+	if runtimeOptions.resetDeltaIdxs {
+		l.Infoln("Reinitializing delta index IDs")
+		ldb.DropDeltaIndexIDs()
+	}
+
 	protectedFiles := []string{
 		locations[locDatabase],
 		locations[locConfigFile],
@@ -663,8 +784,18 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		}
 	}
 
+	if cfg.RawCopy().OriginalVersion == 15 {
+		// The config version 15->16 migration is about handling ignores and
+		// delta indexes and requires that we drop existing indexes that
+		// have been incorrectly ignore filtered.
+		ldb.DropDeltaIndexIDs()
+	}
+	if cfg.RawCopy().OriginalVersion < 19 {
+		// Converts old symlink types to new in the entire database.
+		ldb.ConvertSymlinkTypes()
+	}
+
 	m := model.NewModel(cfg, myID, myDeviceName(cfg), "syncthing", Version, ldb, protectedFiles)
-	cfg.Subscribe(m)
 
 	if t := os.Getenv("STDEADLOCKTIMEOUT"); len(t) > 0 {
 		it, err := strconv.Atoi(t)
@@ -675,23 +806,18 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		m.StartDeadlockDetector(20 * time.Minute)
 	}
 
-	if runtimeOptions.paused {
-		for device := range cfg.Devices() {
-			m.PauseDevice(device)
-		}
+	if runtimeOptions.unpaused {
+		setPauseState(cfg, false)
+	} else if runtimeOptions.paused {
+		setPauseState(cfg, true)
 	}
 
-	// Clear out old indexes for other devices. Otherwise we'll start up and
-	// start needing a bunch of files which are nowhere to be found. This
-	// needs to be changed when we correctly do persistent indexes.
+	// Add and start folders
 	for _, folderCfg := range cfg.Folders() {
-		m.AddFolder(folderCfg)
-		for _, device := range folderCfg.DeviceIDs() {
-			if device == myID {
-				continue
-			}
-			m.Index(device, folderCfg.ID, nil)
+		if folderCfg.Paused {
+			continue
 		}
+		m.AddFolder(folderCfg)
 		m.StartFolder(folderCfg.ID)
 	}
 
@@ -742,7 +868,7 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 
 	// GUI
 
-	setupGUI(mainService, cfg, m, apiSub, cachedDiscovery, connectionsService, errors, systemLog, runtimeOptions)
+	setupGUI(mainService, cfg, m, apiSub, diskSub, cachedDiscovery, connectionsService, errors, systemLog, runtimeOptions)
 
 	if runtimeOptions.cpuProfile {
 		f, err := os.Create(fmt.Sprintf("cpu-%d.pprof", os.Getpid()))
@@ -758,20 +884,26 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		}
 	}
 
+	// Candidate builds always run with usage reporting.
+
+	if IsCandidate {
+		l.Infoln("Anonymous usage reporting is always enabled for candidate releases.")
+		opts.URAccepted = usageReportVersion
+		// Unique ID will be set and config saved below if necessary.
+	}
+
 	if opts.URAccepted > 0 && opts.URAccepted < usageReportVersion {
 		l.Infoln("Anonymous usage report has changed; revoking acceptance")
 		opts.URAccepted = 0
 		opts.URUniqueID = ""
 		cfg.SetOptions(opts)
 	}
-	if opts.URAccepted >= usageReportVersion {
-		if opts.URUniqueID == "" {
-			// Previously the ID was generated from the node ID. We now need
-			// to generate a new one.
-			opts.URUniqueID = rand.String(8)
-			cfg.SetOptions(opts)
-			cfg.Save()
-		}
+
+	if opts.URAccepted >= usageReportVersion && opts.URUniqueID == "" {
+		// Generate and save a new unique ID if it is missing.
+		opts.URUniqueID = rand.String(8)
+		cfg.SetOptions(opts)
+		cfg.Save()
 	}
 
 	// The usageReportingManager registers itself to listen to configuration
@@ -783,8 +915,21 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 		go standbyMonitor()
 	}
 
+	// Candidate builds should auto upgrade. Make sure the option is set,
+	// unless we are in a build where it's disabled or the STNOUPGRADE
+	// environment variable is set.
+
+	if IsCandidate && !upgrade.DisabledByCompilation && !noUpgradeFromEnv {
+		l.Infoln("Automatic upgrade is always enabled for candidate releases.")
+		if opts.AutoUpgradeIntervalH == 0 || opts.AutoUpgradeIntervalH > 24 {
+			opts.AutoUpgradeIntervalH = 12
+		}
+		// We don't tweak the user's choice of upgrading to pre-releases or
+		// not, as otherwise they cannot step off the candidate channel.
+	}
+
 	if opts.AutoUpgradeIntervalH > 0 {
-		if noUpgrade {
+		if noUpgradeFromEnv {
 			l.Infof("No automatic upgrades; STNOUPGRADE environment variable defined.")
 		} else {
 			go autoUpgrade(cfg)
@@ -794,7 +939,6 @@ func syncthingMain(runtimeOptions RuntimeOptions) {
 	events.Default.Log(events.StartupComplete, map[string]string{
 		"myID": myID.String(),
 	})
-	go generatePingEvents()
 
 	cleanConfigDirectory()
 
@@ -842,22 +986,6 @@ func setupSignalHandling() {
 	}()
 }
 
-// printHashRate prints the hashing performance in MB/s, formatting it with
-// appropriate precision for the value, i.e. 182 MB/s, 18 MB/s, 1.8 MB/s, 0.18
-// MB/s.
-func printHashRate() {
-	hashRate := cpuBench(3, 100*time.Millisecond)
-
-	decimals := 0
-	if hashRate < 1 {
-		decimals = 2
-	} else if hashRate < 10 {
-		decimals = 1
-	}
-
-	l.Infof("Single thread hash performance is ~%.*f MB/s", decimals, hashRate)
-}
-
 func loadConfig() (*config.Wrapper, error) {
 	cfgFile := locations[locConfigFile]
 	cfg, err := config.Load(cfgFile, myID)
@@ -880,7 +1008,7 @@ func loadOrCreateConfig() *config.Wrapper {
 		l.Fatalln("Config:", err)
 	}
 
-	if cfg.Raw().OriginalVersion != config.CurrentVersion {
+	if cfg.RawCopy().OriginalVersion != config.CurrentVersion {
 		err = archiveAndSaveConfig(cfg)
 		if err != nil {
 			l.Fatalln("Config archive:", err)
@@ -891,24 +1019,57 @@ func loadOrCreateConfig() *config.Wrapper {
 }
 
 func archiveAndSaveConfig(cfg *config.Wrapper) error {
-	// To prevent previous config from being cleaned up, quickly touch it too
-	now := time.Now()
-	_ = os.Chtimes(cfg.ConfigPath(), now, now) // May return error on Android etc; no worries
-
-	archivePath := cfg.ConfigPath() + fmt.Sprintf(".v%d", cfg.Raw().OriginalVersion)
+	// Copy the existing config to an archive copy
+	archivePath := cfg.ConfigPath() + fmt.Sprintf(".v%d", cfg.RawCopy().OriginalVersion)
 	l.Infoln("Archiving a copy of old config file format at:", archivePath)
-	if err := osutil.Rename(cfg.ConfigPath(), archivePath); err != nil {
+	if err := copyFile(cfg.ConfigPath(), archivePath); err != nil {
 		return err
 	}
 
+	// Do a regular atomic config sve
 	return cfg.Save()
 }
 
-func startAuditing(mainService *suture.Supervisor) {
-	auditFile := timestampedLoc(locAuditLog)
-	fd, err := os.OpenFile(auditFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+func copyFile(src, dst string) error {
+	bs, err := ioutil.ReadFile(src)
 	if err != nil {
-		l.Fatalln("Audit:", err)
+		return err
+	}
+
+	if err := ioutil.WriteFile(dst, bs, 0600); err != nil {
+		// Attempt to clean up
+		os.Remove(dst)
+		return err
+	}
+
+	return nil
+}
+
+func startAuditing(mainService *suture.Supervisor, auditFile string) {
+
+	var fd io.Writer
+	var err error
+	var auditDest string
+	var auditFlags int
+
+	if auditFile == "-" {
+		fd = os.Stdout
+		auditDest = "stdout"
+	} else if auditFile == "--" {
+		fd = os.Stderr
+		auditDest = "stderr"
+	} else {
+		if auditFile == "" {
+			auditFile = timestampedLoc(locAuditLog)
+			auditFlags = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+		} else {
+			auditFlags = os.O_WRONLY | os.O_CREATE | os.O_APPEND
+		}
+		fd, err = os.OpenFile(auditFile, auditFlags, 0600)
+		if err != nil {
+			l.Fatalln("Audit:", err)
+		}
+		auditDest = auditFile
 	}
 
 	auditService := newAuditService(fd)
@@ -918,10 +1079,10 @@ func startAuditing(mainService *suture.Supervisor) {
 	// ensure we capture all events from the start.
 	auditService.WaitForStart()
 
-	l.Infoln("Audit log in", auditFile)
+	l.Infoln("Audit log in", auditDest)
 }
 
-func setupGUI(mainService *suture.Supervisor, cfg *config.Wrapper, m *model.Model, apiSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService *connections.Service, errors, systemLog logger.Recorder, runtimeOptions RuntimeOptions) {
+func setupGUI(mainService *suture.Supervisor, cfg *config.Wrapper, m *model.Model, apiSub events.BufferedSubscription, diskSub events.BufferedSubscription, discoverer discover.CachingMux, connectionsService *connections.Service, errors, systemLog logger.Recorder, runtimeOptions RuntimeOptions) {
 	guiCfg := cfg.GUI()
 
 	if !guiCfg.Enabled {
@@ -932,13 +1093,14 @@ func setupGUI(mainService *suture.Supervisor, cfg *config.Wrapper, m *model.Mode
 		l.Warnln("Insecure admin access is enabled.")
 	}
 
-	api := newAPIService(myID, cfg, locations[locHTTPSCertFile], locations[locHTTPSKeyFile], runtimeOptions.assetDir, m, apiSub, discoverer, connectionsService, errors, systemLog)
+	api := newAPIService(myID, cfg, locations[locHTTPSCertFile], locations[locHTTPSKeyFile], runtimeOptions.assetDir, m, apiSub, diskSub, discoverer, connectionsService, errors, systemLog)
 	cfg.Subscribe(api)
 	mainService.Add(api)
 
 	if cfg.Options().StartBrowser && !runtimeOptions.noBrowser && !runtimeOptions.stRestarting {
 		// Can potentially block if the utility we are invoking doesn't
 		// fork, and just execs, hence keep it in it's own routine.
+		<-api.startedOnce
 		go openURL(guiCfg.URL())
 	}
 }
@@ -948,9 +1110,8 @@ func defaultConfig(myName string) config.Configuration {
 
 	if !noDefaultFolder {
 		l.Infoln("Default folder created and/or linked to new config")
-		folderID := rand.String(5) + "-" + rand.String(5)
-		defaultFolder = config.NewFolderConfiguration(folderID, locations[locDefFolder])
-		defaultFolder.Label = "Default Folder (" + folderID + ")"
+		defaultFolder = config.NewFolderConfiguration("default", locations[locDefFolder])
+		defaultFolder.Label = "Default Folder"
 		defaultFolder.RescanIntervalS = 60
 		defaultFolder.MinDiskFreePct = 1
 		defaultFolder.Devices = []config.FolderDeviceConfiguration{{DeviceID: myID}}
@@ -989,13 +1150,6 @@ func defaultConfig(myName string) config.Configuration {
 	}
 
 	return newCfg
-}
-
-func generatePingEvents() {
-	for {
-		time.Sleep(pingEventInterval)
-		events.Default.Log(events.Ping, nil)
-	}
 }
 
 func resetDB() error {
@@ -1055,7 +1209,7 @@ func getFreePort(host string, ports ...int) (int, error) {
 }
 
 func standbyMonitor() {
-	restartDelay := time.Duration(60 * time.Second)
+	restartDelay := 60 * time.Second
 	now := time.Now()
 	for {
 		time.Sleep(10 * time.Second)
@@ -1087,8 +1241,8 @@ func autoUpgrade(cfg *config.Wrapper) {
 			l.Infof("Connected to device %s with a newer version (current %q < remote %q). Checking for upgrades.", data["id"], Version, data["clientVersion"])
 		case <-timer.C:
 		}
-
-		rel, err := upgrade.LatestRelease(cfg.Options().ReleasesURL, Version)
+		opts := cfg.Options()
+		rel, err := upgrade.LatestRelease(opts.ReleasesURL, Version, opts.UpgradeToPreReleases)
 		if err == upgrade.ErrUpgradeUnsupported {
 			events.Default.Unsubscribe(sub)
 			return
@@ -1126,13 +1280,16 @@ func autoUpgrade(cfg *config.Wrapper) {
 // suitable time after they have gone out of fashion.
 func cleanConfigDirectory() {
 	patterns := map[string]time.Duration{
-		"panic-*.log":      7 * 24 * time.Hour,  // keep panic logs for a week
-		"audit-*.log":      7 * 24 * time.Hour,  // keep audit logs for a week
-		"index":            14 * 24 * time.Hour, // keep old index format for two weeks
-		"index*.converted": 14 * 24 * time.Hour, // keep old converted indexes for two weeks
-		"config.xml.v*":    30 * 24 * time.Hour, // old config versions for a month
-		"*.idx.gz":         30 * 24 * time.Hour, // these should for sure no longer exist
-		"backup-of-v0.8":   30 * 24 * time.Hour, // these neither
+		"panic-*.log":        7 * 24 * time.Hour,  // keep panic logs for a week
+		"audit-*.log":        7 * 24 * time.Hour,  // keep audit logs for a week
+		"index":              14 * 24 * time.Hour, // keep old index format for two weeks
+		"index-v0.11.0.db":   14 * 24 * time.Hour, // keep old index format for two weeks
+		"index-v0.13.0.db":   14 * 24 * time.Hour, // keep old index format for two weeks
+		"index*.converted":   14 * 24 * time.Hour, // keep old converted indexes for two weeks
+		"config.xml.v*":      30 * 24 * time.Hour, // old config versions for a month
+		"*.idx.gz":           30 * 24 * time.Hour, // these should for sure no longer exist
+		"backup-of-v0.8":     30 * 24 * time.Hour, // these neither
+		"tmp-index-sorter.*": time.Minute,         // these should never exist on startup
 	}
 
 	for pat, dur := range patterns {
@@ -1184,4 +1341,17 @@ func showPaths() {
 	fmt.Printf("Log file:\n\t%s\n\n", locations[locLogFile])
 	fmt.Printf("GUI override directory:\n\t%s\n\n", locations[locGUIAssets])
 	fmt.Printf("Default sync folder directory:\n\t%s\n\n", locations[locDefFolder])
+}
+
+func setPauseState(cfg *config.Wrapper, paused bool) {
+	raw := cfg.RawCopy()
+	for i := range raw.Devices {
+		raw.Devices[i].Paused = paused
+	}
+	for i := range raw.Folders {
+		raw.Folders[i].Paused = paused
+	}
+	if err := cfg.Replace(raw); err != nil {
+		l.Fatalln("Cannot adjust paused state:", err)
+	}
 }

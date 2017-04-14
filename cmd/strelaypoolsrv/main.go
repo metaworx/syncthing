@@ -1,6 +1,6 @@
 // Copyright (C) 2015 Audrius Butkevicius and Contributors (see the CONTRIBUTORS file).
 
-//go:generate go run genassets.go gui auto/gui.go
+//go:generate go run ../../script/genassets.go gui >auto/gui.go
 
 package main
 
@@ -23,14 +23,12 @@ import (
 	"time"
 
 	"github.com/golang/groupcache/lru"
-	"github.com/juju/ratelimit"
-
 	"github.com/oschwald/geoip2-golang"
-
 	"github.com/syncthing/syncthing/cmd/strelaypoolsrv/auto"
 	"github.com/syncthing/syncthing/lib/relay/client"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/tlsutil"
+	"golang.org/x/time/rate"
 )
 
 type location struct {
@@ -61,34 +59,35 @@ type result struct {
 
 var (
 	testCert       tls.Certificate
-	listen         string        = ":80"
-	dir            string        = ""
-	evictionTime   time.Duration = time.Hour
-	debug          bool          = false
-	getLRUSize     int           = 10 << 10
-	getLimitBurst  int64         = 10
-	getLimitAvg                  = 1
-	postLRUSize    int           = 1 << 10
-	postLimitBurst int64         = 2
-	postLimitAvg                 = 1
+	listen         = ":80"
+	dir            string
+	evictionTime   = time.Hour
+	debug          bool
+	getLRUSize     = 10 << 10
+	getLimitBurst  = 10
+	getLimitAvg    = 1
+	postLRUSize    = 1 << 10
+	postLimitBurst = 2
+	postLimitAvg   = 1
 	getLimit       time.Duration
 	postLimit      time.Duration
 	permRelaysFile string
 	ipHeader       string
 	geoipPath      string
+	proto          string
 
-	getMut      sync.RWMutex = sync.NewRWMutex()
+	getMut      = sync.NewRWMutex()
 	getLRUCache *lru.Cache
 
-	postMut      sync.RWMutex = sync.NewRWMutex()
+	postMut      = sync.NewRWMutex()
 	postLRUCache *lru.Cache
 
 	requests = make(chan request, 10)
 
-	mut             sync.RWMutex           = sync.NewRWMutex()
-	knownRelays     []relay                = make([]relay, 0)
-	permanentRelays []relay                = make([]relay, 0)
-	evictionTimers  map[string]*time.Timer = make(map[string]*time.Timer)
+	mut             = sync.NewRWMutex()
+	knownRelays     = make([]relay, 0)
+	permanentRelays = make([]relay, 0)
+	evictionTimers  = make(map[string]*time.Timer)
 )
 
 func main() {
@@ -98,13 +97,14 @@ func main() {
 	flag.DurationVar(&evictionTime, "eviction", evictionTime, "After how long the relay is evicted")
 	flag.IntVar(&getLRUSize, "get-limit-cache", getLRUSize, "Get request limiter cache size")
 	flag.IntVar(&getLimitAvg, "get-limit-avg", 2, "Allowed average get request rate, per 10 s")
-	flag.Int64Var(&getLimitBurst, "get-limit-burst", getLimitBurst, "Allowed burst get requests")
+	flag.IntVar(&getLimitBurst, "get-limit-burst", getLimitBurst, "Allowed burst get requests")
 	flag.IntVar(&postLRUSize, "post-limit-cache", postLRUSize, "Post request limiter cache size")
 	flag.IntVar(&postLimitAvg, "post-limit-avg", 2, "Allowed average post request rate, per minute")
-	flag.Int64Var(&postLimitBurst, "post-limit-burst", postLimitBurst, "Allowed burst post requests")
+	flag.IntVar(&postLimitBurst, "post-limit-burst", postLimitBurst, "Allowed burst post requests")
 	flag.StringVar(&permRelaysFile, "perm-relays", "", "Path to list of permanent relays")
 	flag.StringVar(&ipHeader, "ip-header", "", "Name of header which holds clients ip:port. Only meaningful when running behind a reverse proxy.")
 	flag.StringVar(&geoipPath, "geoip", "GeoLite2-City.mmdb", "Path to GeoLite2-City database")
+	flag.StringVar(&proto, "protocol", "tcp", "Protocol used for listening. 'tcp' for IPv4 and IPv6, 'tcp4' for IPv4, 'tcp6' for IPv6")
 
 	flag.Parse()
 
@@ -130,7 +130,8 @@ func main() {
 			log.Println("Starting TLS listener on", listen)
 		}
 		certFile, keyFile := filepath.Join(dir, "http-cert.pem"), filepath.Join(dir, "http-key.pem")
-		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		var cert tls.Certificate
+		cert, err = tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			log.Fatalln("Failed to load HTTP X509 key pair:", err)
 		}
@@ -153,12 +154,12 @@ func main() {
 			},
 		}
 
-		listener, err = tls.Listen("tcp", listen, tlsCfg)
+		listener, err = tls.Listen(proto, listen, tlsCfg)
 	} else {
 		if debug {
 			log.Println("Starting plain listener on", listen)
 		}
-		listener, err = net.Listen("tcp", listen)
+		listener, err = net.Listen(proto, listen)
 	}
 
 	if err != nil {
@@ -246,13 +247,13 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	switch r.Method {
 	case "GET":
-		if limit(r.RemoteAddr, getLRUCache, getMut, getLimit, int64(getLimitBurst)) {
+		if limit(r.RemoteAddr, getLRUCache, getMut, getLimit, getLimitBurst) {
 			w.WriteHeader(429)
 			return
 		}
 		handleGetRequest(w, r)
 	case "POST":
-		if limit(r.RemoteAddr, postLRUCache, postMut, postLimit, int64(postLimitBurst)) {
+		if limit(r.RemoteAddr, postLRUCache, postMut, postLimit, postLimitBurst) {
 			w.WriteHeader(429)
 			return
 		}
@@ -323,8 +324,9 @@ func handlePostRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	ip := net.ParseIP(host)
 	// The client did not provide an IP address, use the IP address of the client.
-	if host == "" {
+	if ip == nil || ip.IsUnspecified() {
 		uri.Host = net.JoinHostPort(rhost, port)
 		newRelay.URL = uri.String()
 	} else if host != rhost {
@@ -442,7 +444,7 @@ func evict(relay relay) func() {
 	}
 }
 
-func limit(addr string, cache *lru.Cache, lock sync.RWMutex, rate time.Duration, burst int64) bool {
+func limit(addr string, cache *lru.Cache, lock sync.RWMutex, intv time.Duration, burst int) bool {
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return false
@@ -452,14 +454,14 @@ func limit(addr string, cache *lru.Cache, lock sync.RWMutex, rate time.Duration,
 	bkt, ok := cache.Get(host)
 	lock.RUnlock()
 	if ok {
-		bkt := bkt.(*ratelimit.Bucket)
-		if bkt.TakeAvailable(1) != 1 {
+		bkt := bkt.(*rate.Limiter)
+		if !bkt.Allow() {
 			// Rate limit
 			return true
 		}
 	} else {
 		lock.Lock()
-		cache.Add(host, ratelimit.NewBucket(rate, burst))
+		cache.Add(host, rate.NewLimiter(rate.Every(intv), burst))
 		lock.Unlock()
 	}
 	return false

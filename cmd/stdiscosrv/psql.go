@@ -27,8 +27,9 @@ func postgresSetup(db *sql.DB) error {
 		return err
 	}
 
+	var tmp string
 	row := db.QueryRow(`SELECT 'DevicesDeviceIDIndex'::regclass`)
-	if err := row.Scan(nil); err != nil {
+	if err = row.Scan(&tmp); err != nil {
 		_, err = db.Exec(`CREATE INDEX DevicesDeviceIDIndex ON Devices (DeviceID)`)
 	}
 	if err != nil {
@@ -36,7 +37,7 @@ func postgresSetup(db *sql.DB) error {
 	}
 
 	row = db.QueryRow(`SELECT 'DevicesSeenIndex'::regclass`)
-	if err := row.Scan(nil); err != nil {
+	if err = row.Scan(&tmp); err != nil {
 		_, err = db.Exec(`CREATE INDEX DevicesSeenIndex ON Devices (Seen)`)
 	}
 	if err != nil {
@@ -46,14 +47,14 @@ func postgresSetup(db *sql.DB) error {
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS Addresses (
 		DeviceID CHAR(63) NOT NULL,
 		Seen TIMESTAMP NOT NULL,
-		Address VARCHAR(256) NOT NULL
+		Address VARCHAR(2048) NOT NULL
 	)`)
 	if err != nil {
 		return err
 	}
 
 	row = db.QueryRow(`SELECT 'AddressesDeviceIDSeenIndex'::regclass`)
-	if err := row.Scan(nil); err != nil {
+	if err = row.Scan(&tmp); err != nil {
 		_, err = db.Exec(`CREATE INDEX AddressesDeviceIDSeenIndex ON Addresses (DeviceID, Seen)`)
 	}
 	if err != nil {
@@ -61,7 +62,7 @@ func postgresSetup(db *sql.DB) error {
 	}
 
 	row = db.QueryRow(`SELECT 'AddressesDeviceIDAddressIndex'::regclass`)
-	if err := row.Scan(nil); err != nil {
+	if err = row.Scan(&tmp); err != nil {
 		_, err = db.Exec(`CREATE INDEX AddressesDeviceIDAddressIndex ON Addresses (DeviceID, Address)`)
 	}
 	if err != nil {

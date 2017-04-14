@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package db
 
@@ -74,18 +74,12 @@ func (t readWriteTransaction) flush() {
 	atomic.AddInt64(&t.db.committed, int64(t.Batch.Len()))
 }
 
-func (t readWriteTransaction) insertFile(folder, device []byte, file protocol.FileInfo) int64 {
+func (t readWriteTransaction) insertFile(folder, device []byte, file protocol.FileInfo) {
 	l.Debugf("insert; folder=%q device=%v %v", folder, protocol.DeviceIDFromBytes(device), file)
-
-	if file.LocalVersion == 0 {
-		file.LocalVersion = clock(0)
-	}
 
 	name := []byte(file.Name)
 	nk := t.db.deviceKey(folder, device, name)
 	t.Put(nk, mustMarshal(&file))
-
-	return file.LocalVersion
 }
 
 // updateGlobal adds this device+version to the version list for the given
@@ -134,7 +128,7 @@ func (t readWriteTransaction) updateGlobal(folder, device []byte, file protocol.
 		Version: file.Version,
 	}
 
-	insertedAt := -1
+	var insertedAt int
 	// Find a position in the list to insert this file. The file at the front
 	// of the list is the newer, the "global".
 	for i := range fl.Versions {

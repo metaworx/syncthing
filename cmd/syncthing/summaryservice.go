@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package main
 
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/syncthing/syncthing/lib/events"
+	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/thejerf/suture"
 )
@@ -59,7 +60,7 @@ func (c *folderSummaryService) Stop() {
 // listenForUpdates subscribes to the event bus and makes note of folders that
 // need their data recalculated.
 func (c *folderSummaryService) listenForUpdates() {
-	sub := events.Default.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress)
+	sub := events.Default.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress | events.DeviceConnected)
 	defer events.Default.Unsubscribe(sub)
 
 	for {
@@ -67,8 +68,31 @@ func (c *folderSummaryService) listenForUpdates() {
 
 		select {
 		case ev := <-sub.C():
-			// Whenever the local or remote index is updated for a given
-			// folder we make a note of it.
+			if ev.Type == events.DeviceConnected {
+				// When a device connects we schedule a refresh of all
+				// folders shared with that device.
+
+				data := ev.Data.(map[string]string)
+				deviceID, _ := protocol.DeviceIDFromString(data["id"])
+
+				c.foldersMut.Lock()
+			nextFolder:
+				for _, folder := range c.cfg.Folders() {
+					for _, dev := range folder.Devices {
+						if dev.DeviceID == deviceID {
+							c.folders[folder.ID] = struct{}{}
+							continue nextFolder
+						}
+					}
+				}
+				c.foldersMut.Unlock()
+
+				continue
+			}
+
+			// The other events all have a "folder" attribute that they
+			// affect. Whenever the local or remote index is updated for a
+			// given folder we make a note of it.
 
 			data := ev.Data.(map[string]interface{})
 			folder := data["folder"].(string)
@@ -145,7 +169,7 @@ func (c *folderSummaryService) foldersToHandle() []string {
 	c.lastEventReqMut.Lock()
 	last := c.lastEventReq
 	c.lastEventReqMut.Unlock()
-	if time.Since(last) > pingEventInterval {
+	if time.Since(last) > defaultEventTimeout {
 		return nil
 	}
 
@@ -183,9 +207,11 @@ func (c *folderSummaryService) sendSummary(folder string) {
 		// remote device.
 		comp := c.model.Completion(devCfg.DeviceID, folder)
 		events.Default.Log(events.FolderCompletion, map[string]interface{}{
-			"folder":     folder,
-			"device":     devCfg.DeviceID.String(),
-			"completion": comp,
+			"folder":      folder,
+			"device":      devCfg.DeviceID.String(),
+			"completion":  comp.CompletionPct,
+			"needBytes":   comp.NeedBytes,
+			"globalBytes": comp.GlobalBytes,
 		})
 	}
 }

@@ -19,9 +19,9 @@ import (
 	"time"
 
 	"github.com/golang/groupcache/lru"
-	"github.com/juju/ratelimit"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"golang.org/x/net/context"
+	"golang.org/x/time/rate"
 )
 
 type querysrv struct {
@@ -61,6 +61,10 @@ type requestID int64
 func (i requestID) String() string {
 	return fmt.Sprintf("%016x", int64(i))
 }
+
+type contextKey int
+
+const idKey contextKey = iota
 
 func negCacheFor(lastSeen time.Time) int {
 	since := time.Since(lastSeen).Seconds()
@@ -132,7 +136,7 @@ var topCtx = context.Background()
 
 func (s *querysrv) handler(w http.ResponseWriter, req *http.Request) {
 	reqID := requestID(rand.Int63())
-	ctx := context.WithValue(topCtx, "id", reqID)
+	ctx := context.WithValue(topCtx, idKey, reqID)
 
 	if debug {
 		log.Println(reqID, req.Method, req.URL)
@@ -186,7 +190,7 @@ func (s *querysrv) handler(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *querysrv) handleGET(ctx context.Context, w http.ResponseWriter, req *http.Request) {
-	reqID := ctx.Value("id").(requestID)
+	reqID := ctx.Value(idKey).(requestID)
 
 	deviceID, err := protocol.DeviceIDFromString(req.URL.Query().Get("device"))
 	if err != nil {
@@ -238,7 +242,7 @@ func (s *querysrv) handleGET(ctx context.Context, w http.ResponseWriter, req *ht
 }
 
 func (s *querysrv) handlePOST(ctx context.Context, remoteIP net.IP, w http.ResponseWriter, req *http.Request) {
-	reqID := ctx.Value("id").(requestID)
+	reqID := ctx.Value(idKey).(requestID)
 
 	rawCert := certificateBytes(req)
 	if rawCert == nil {
@@ -299,7 +303,7 @@ func (s *querysrv) Stop() {
 }
 
 func (s *querysrv) handleAnnounce(ctx context.Context, remote net.IP, deviceID protocol.DeviceID, addresses []string) (userErr, internalErr error) {
-	reqID := ctx.Value("id").(requestID)
+	reqID := ctx.Value(idKey).(requestID)
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -369,21 +373,21 @@ func (s *querysrv) limit(remote net.IP) bool {
 
 	bkt, ok := s.limiter.Get(key)
 	if ok {
-		bkt := bkt.(*ratelimit.Bucket)
-		if bkt.TakeAvailable(1) != 1 {
+		bkt := bkt.(*rate.Limiter)
+		if !bkt.Allow() {
 			// Rate limit exceeded; ignore packet
 			return true
 		}
 	} else {
-		// One packet per ten seconds average rate, burst ten packets
-		s.limiter.Add(key, ratelimit.NewBucket(10*time.Second/time.Duration(limitAvg), int64(limitBurst)))
+		// limitAvg is in packets per ten seconds.
+		s.limiter.Add(key, rate.NewLimiter(rate.Limit(limitAvg)/10, limitBurst))
 	}
 
 	return false
 }
 
 func (s *querysrv) updateDevice(ctx context.Context, tx *sql.Tx, device protocol.DeviceID) error {
-	reqID := ctx.Value("id").(requestID)
+	reqID := ctx.Value(idKey).(requestID)
 	t0 := time.Now()
 	res, err := tx.Stmt(s.prep["updateDevice"]).Exec(device.String())
 	if err != nil {
@@ -451,7 +455,7 @@ func (s *querysrv) getDeviceSeen(device protocol.DeviceID) (time.Time, error) {
 	if err := row.Scan(&seen); err != nil {
 		return time.Time{}, err
 	}
-	return seen, nil
+	return seen.In(time.UTC), nil
 }
 
 func handlePing(w http.ResponseWriter, r *http.Request) {

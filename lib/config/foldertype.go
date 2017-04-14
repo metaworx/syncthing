@@ -2,22 +2,22 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package config
 
 type FolderType int
 
 const (
-	FolderTypeReadWrite FolderType = iota // default is readwrite
-	FolderTypeReadOnly
+	FolderTypeSendReceive FolderType = iota // default is sendreceive
+	FolderTypeSendOnly
 )
 
 func (t FolderType) String() string {
 	switch t {
-	case FolderTypeReadWrite:
+	case FolderTypeSendReceive:
 		return "readwrite"
-	case FolderTypeReadOnly:
+	case FolderTypeSendOnly:
 		return "readonly"
 	default:
 		return "unknown"
@@ -30,12 +30,12 @@ func (t FolderType) MarshalText() ([]byte, error) {
 
 func (t *FolderType) UnmarshalText(bs []byte) error {
 	switch string(bs) {
-	case "readwrite":
-		*t = FolderTypeReadWrite
-	case "readonly":
-		*t = FolderTypeReadOnly
+	case "readwrite", "sendreceive":
+		*t = FolderTypeSendReceive
+	case "readonly", "sendonly":
+		*t = FolderTypeSendOnly
 	default:
-		*t = FolderTypeReadWrite
+		*t = FolderTypeSendReceive
 	}
 	return nil
 }

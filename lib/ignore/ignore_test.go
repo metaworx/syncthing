@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package ignore
 
@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestIgnore(t *testing.T) {
@@ -276,9 +277,13 @@ func TestCaching(t *testing.T) {
 		t.Fatal("Expected 4 cached results")
 	}
 
-	// Modify the include file, expect empty cache
+	// Modify the include file, expect empty cache. Ensure the timestamp on
+	// the file changes.
 
 	fd2.WriteString("/z/\n")
+	fd2.Sync()
+	fakeTime := time.Now().Add(5 * time.Second)
+	os.Chtimes(fd2.Name(), fakeTime, fakeTime)
 
 	err = pats.Load(fd1.Name())
 	if err != nil {
@@ -308,6 +313,9 @@ func TestCaching(t *testing.T) {
 	// Modify the root file, expect cache to be invalidated
 
 	fd1.WriteString("/a/\n")
+	fd1.Sync()
+	fakeTime = time.Now().Add(5 * time.Second)
+	os.Chtimes(fd1.Name(), fakeTime, fakeTime)
 
 	err = pats.Load(fd1.Name())
 	if err != nil {
@@ -484,6 +492,9 @@ func TestCacheReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	fd.Sync()
+	fakeTime := time.Now().Add(5 * time.Second)
+	os.Chtimes(fd.Name(), fakeTime, fakeTime)
 
 	err = pats.Load(fd.Name())
 	if err != nil {
@@ -716,5 +727,119 @@ func TestIssue3174(t *testing.T) {
 
 	if !pats.Match("åäö").IsIgnored() {
 		t.Error("Should match")
+	}
+}
+
+func TestIssue3639(t *testing.T) {
+	stignore := `
+	foo/
+	`
+	pats := New(true)
+	err := pats.Parse(bytes.NewBufferString(stignore), ".stignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !pats.Match("foo/bar").IsIgnored() {
+		t.Error("Should match 'foo/bar'")
+	}
+
+	if pats.Match("foo").IsIgnored() {
+		t.Error("Should not match 'foo'")
+	}
+}
+
+func TestIssue3674(t *testing.T) {
+	stignore := `
+	a*b
+	a**c
+	`
+
+	testcases := []struct {
+		file    string
+		matches bool
+	}{
+		{"ab", true},
+		{"asdfb", true},
+		{"ac", true},
+		{"asdfc", true},
+		{"as/db", false},
+		{"as/dc", true},
+	}
+
+	pats := New(true)
+	err := pats.Parse(bytes.NewBufferString(stignore), ".stignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range testcases {
+		res := pats.Match(tc.file).IsIgnored()
+		if res != tc.matches {
+			t.Errorf("Matches(%q) == %v, expected %v", tc.file, res, tc.matches)
+		}
+	}
+}
+
+func TestGobwasGlobIssue18(t *testing.T) {
+	stignore := `
+	a?b
+	bb?
+	`
+
+	testcases := []struct {
+		file    string
+		matches bool
+	}{
+		{"ab", false},
+		{"acb", true},
+		{"asdb", false},
+		{"bb", false},
+		{"bba", true},
+		{"bbaa", false},
+	}
+
+	pats := New(true)
+	err := pats.Parse(bytes.NewBufferString(stignore), ".stignore")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range testcases {
+		res := pats.Match(tc.file).IsIgnored()
+		if res != tc.matches {
+			t.Errorf("Matches(%q) == %v, expected %v", tc.file, res, tc.matches)
+		}
+	}
+}
+
+func TestIsInternal(t *testing.T) {
+	cases := []struct {
+		file     string
+		internal bool
+	}{
+		{".stfolder", true},
+		{".stignore", true},
+		{".stversions", true},
+		{".stfolder/foo", true},
+		{".stignore/foo", true},
+		{".stversions/foo", true},
+
+		{".stfolderfoo", false},
+		{".stignorefoo", false},
+		{".stversionsfoo", false},
+		{"foo.stfolder", false},
+		{"foo.stignore", false},
+		{"foo.stversions", false},
+		{"foo/.stfolder", false},
+		{"foo/.stignore", false},
+		{"foo/.stversions", false},
+	}
+
+	for _, tc := range cases {
+		res := IsInternal(filepath.FromSlash(tc.file))
+		if res != tc.internal {
+			t.Errorf("Unexpected result: IsInteral(%q): %v should be %v", tc.file, res, tc.internal)
+		}
 	}
 }

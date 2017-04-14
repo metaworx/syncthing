@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connections
 
@@ -29,8 +29,9 @@ type relayListener struct {
 	onAddressesChangedNotifier
 
 	uri     *url.URL
+	cfg     *config.Wrapper
 	tlsCfg  *tls.Config
-	conns   chan IntermediateConnection
+	conns   chan internalConn
 	factory listenerFactory
 
 	err    error
@@ -44,6 +45,7 @@ func (t *relayListener) Serve() {
 	t.mut.Unlock()
 
 	clnt, err := client.NewClient(t.uri, t.tlsCfg.Certificates, nil, 10*time.Second)
+	invitations := clnt.Invitations()
 	if err != nil {
 		t.mut.Lock()
 		t.err = err
@@ -62,7 +64,7 @@ func (t *relayListener) Serve() {
 
 	for {
 		select {
-		case inv, ok := <-t.client.Invitations():
+		case inv, ok := <-invitations:
 			if !ok {
 				return
 			}
@@ -76,6 +78,11 @@ func (t *relayListener) Serve() {
 			err = dialer.SetTCPOptions(conn)
 			if err != nil {
 				l.Infoln(err)
+			}
+
+			err = dialer.SetTrafficClass(conn, t.cfg.Options().TrafficClass)
+			if err != nil {
+				l.Debugf("failed to set traffic class: %s", err)
 			}
 
 			var tc *tls.Conn
@@ -92,7 +99,7 @@ func (t *relayListener) Serve() {
 				continue
 			}
 
-			t.conns <- IntermediateConnection{tc, "Relay (Server)", relayPriority}
+			t.conns <- internalConn{tc, connTypeRelayServer, relayPriority}
 
 		// Poor mans notifier that informs the connection service that the
 		// relay URI has changed. This can only happen when we connect to a
@@ -166,9 +173,10 @@ func (t *relayListener) String() string {
 
 type relayListenerFactory struct{}
 
-func (f *relayListenerFactory) New(uri *url.URL, cfg *config.Wrapper, tlsCfg *tls.Config, conns chan IntermediateConnection, natService *nat.Service) genericListener {
+func (f *relayListenerFactory) New(uri *url.URL, cfg *config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
 	return &relayListener{
 		uri:     uri,
+		cfg:     cfg,
 		tlsCfg:  tlsCfg,
 		conns:   conns,
 		factory: f,

@@ -2,16 +2,18 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package config
 
 import (
 	"os"
+	"sync/atomic"
 
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/util"
 )
@@ -41,11 +43,6 @@ type Committer interface {
 	String() string
 }
 
-type CommitResponse struct {
-	ValidationError error
-	RequiresRestart bool
-}
-
 // A wrapper around a Configuration that manages loads, saves and published
 // notifications of changes to registered Handlers
 
@@ -58,6 +55,8 @@ type Wrapper struct {
 	replaces  chan Configuration
 	subs      []Committer
 	mut       sync.Mutex
+
+	requiresRestart uint32 // an atomic bool
 }
 
 // Wrap wraps an existing Configuration structure and ties it to a file on
@@ -122,38 +121,33 @@ func (w *Wrapper) Unsubscribe(c Committer) {
 	w.mut.Unlock()
 }
 
-// Raw returns the currently wrapped Configuration object.
-func (w *Wrapper) Raw() Configuration {
-	return w.cfg
+// RawCopy returns a copy of the currently wrapped Configuration object.
+func (w *Wrapper) RawCopy() Configuration {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	return w.cfg.Copy()
 }
 
 // Replace swaps the current configuration object for the given one.
-func (w *Wrapper) Replace(cfg Configuration) CommitResponse {
+func (w *Wrapper) Replace(cfg Configuration) error {
 	w.mut.Lock()
 	defer w.mut.Unlock()
+
 	return w.replaceLocked(cfg)
 }
 
-func (w *Wrapper) replaceLocked(to Configuration) CommitResponse {
+func (w *Wrapper) replaceLocked(to Configuration) error {
 	from := w.cfg
+
+	if err := to.clean(); err != nil {
+		return err
+	}
 
 	for _, sub := range w.subs {
 		l.Debugln(sub, "verifying configuration")
 		if err := sub.VerifyConfiguration(from, to); err != nil {
 			l.Debugln(sub, "rejected config:", err)
-			return CommitResponse{
-				ValidationError: err,
-			}
-		}
-	}
-
-	allOk := true
-	for _, sub := range w.subs {
-		l.Debugln(sub, "committing configuration")
-		ok := sub.CommitConfiguration(from, to)
-		if !ok {
-			l.Debugln(sub, "requires restart")
-			allOk = false
+			return err
 		}
 	}
 
@@ -161,8 +155,22 @@ func (w *Wrapper) replaceLocked(to Configuration) CommitResponse {
 	w.deviceMap = nil
 	w.folderMap = nil
 
-	return CommitResponse{
-		RequiresRestart: !allOk,
+	w.notifyListeners(from, to)
+
+	return nil
+}
+
+func (w *Wrapper) notifyListeners(from, to Configuration) {
+	for _, sub := range w.subs {
+		go w.notifyListener(sub, from.Copy(), to.Copy())
+	}
+}
+
+func (w *Wrapper) notifyListener(sub Committer, from, to Configuration) {
+	l.Debugln(sub, "committing configuration")
+	if !sub.CommitConfiguration(from, to) {
+		l.Debugln(sub, "requires restart")
+		w.setRequiresRestart()
 	}
 }
 
@@ -180,23 +188,53 @@ func (w *Wrapper) Devices() map[protocol.DeviceID]DeviceConfiguration {
 	return w.deviceMap
 }
 
-// SetDevice adds a new device to the configuration, or overwrites an existing
-// device with the same ID.
-func (w *Wrapper) SetDevice(dev DeviceConfiguration) CommitResponse {
+// SetDevices adds new devices to the configuration, or overwrites existing
+// devices with the same ID.
+func (w *Wrapper) SetDevices(devs []DeviceConfiguration) error {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 
 	newCfg := w.cfg.Copy()
-	replaced := false
+	var replaced bool
+	for oldIndex := range devs {
+		replaced = false
+		for newIndex := range newCfg.Devices {
+			if newCfg.Devices[newIndex].DeviceID == devs[oldIndex].DeviceID {
+				newCfg.Devices[newIndex] = devs[oldIndex]
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			newCfg.Devices = append(newCfg.Devices, devs[oldIndex])
+		}
+	}
+
+	return w.replaceLocked(newCfg)
+}
+
+// SetDevice adds a new device to the configuration, or overwrites an existing
+// device with the same ID.
+func (w *Wrapper) SetDevice(dev DeviceConfiguration) error {
+	return w.SetDevices([]DeviceConfiguration{dev})
+}
+
+// RemoveDevice removes the device from the configuration
+func (w *Wrapper) RemoveDevice(id protocol.DeviceID) error {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+
+	newCfg := w.cfg.Copy()
+	removed := false
 	for i := range newCfg.Devices {
-		if newCfg.Devices[i].DeviceID == dev.DeviceID {
-			newCfg.Devices[i] = dev
-			replaced = true
+		if newCfg.Devices[i].DeviceID == id {
+			newCfg.Devices = append(newCfg.Devices[:i], newCfg.Devices[i+1:]...)
+			removed = true
 			break
 		}
 	}
-	if !replaced {
-		newCfg.Devices = append(w.cfg.Devices, dev)
+	if !removed {
+		return nil
 	}
 
 	return w.replaceLocked(newCfg)
@@ -218,7 +256,7 @@ func (w *Wrapper) Folders() map[string]FolderConfiguration {
 
 // SetFolder adds a new folder to the configuration, or overwrites an existing
 // folder with the same ID.
-func (w *Wrapper) SetFolder(fld FolderConfiguration) CommitResponse {
+func (w *Wrapper) SetFolder(fld FolderConfiguration) error {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 
@@ -246,7 +284,7 @@ func (w *Wrapper) Options() OptionsConfiguration {
 }
 
 // SetOptions replaces the current options configuration object.
-func (w *Wrapper) SetOptions(opts OptionsConfiguration) CommitResponse {
+func (w *Wrapper) SetOptions(opts OptionsConfiguration) error {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	newCfg := w.cfg.Copy()
@@ -262,7 +300,7 @@ func (w *Wrapper) GUI() GUIConfiguration {
 }
 
 // SetGUI replaces the current GUI configuration object.
-func (w *Wrapper) SetGUI(gui GUIConfiguration) CommitResponse {
+func (w *Wrapper) SetGUI(gui GUIConfiguration) error {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	newCfg := w.cfg.Copy()
@@ -283,19 +321,46 @@ func (w *Wrapper) IgnoredDevice(id protocol.DeviceID) bool {
 	return false
 }
 
+// Device returns the configuration for the given device and an "ok" bool.
+func (w *Wrapper) Device(id protocol.DeviceID) (DeviceConfiguration, bool) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	for _, device := range w.cfg.Devices {
+		if device.DeviceID == id {
+			return device, true
+		}
+	}
+	return DeviceConfiguration{}, false
+}
+
+// Folder returns the configuration for the given folder and an "ok" bool.
+func (w *Wrapper) Folder(id string) (FolderConfiguration, bool) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	for _, folder := range w.cfg.Folders {
+		if folder.ID == id {
+			return folder, true
+		}
+	}
+	return FolderConfiguration{}, false
+}
+
 // Save writes the configuration to disk, and generates a ConfigSaved event.
 func (w *Wrapper) Save() error {
-	fd, err := osutil.CreateAtomic(w.path, 0600)
+	fd, err := osutil.CreateAtomic(w.path)
 	if err != nil {
+		l.Debugln("CreateAtomic:", err)
 		return err
 	}
 
 	if err := w.cfg.WriteXML(fd); err != nil {
+		l.Debugln("WriteXML:", err)
 		fd.Close()
 		return err
 	}
 
 	if err := fd.Close(); err != nil {
+		l.Debugln("Close:", err)
 		return err
 	}
 
@@ -326,9 +391,43 @@ func (w *Wrapper) ListenAddresses() []string {
 		switch addr {
 		case "default":
 			addresses = append(addresses, DefaultListenAddresses...)
+			if w.cfg.Options.DefaultKCPEnabled { // temporary feature flag
+				addresses = append(addresses, DefaultKCPListenAddress)
+			}
 		default:
 			addresses = append(addresses, addr)
 		}
 	}
 	return util.UniqueStrings(addresses)
+}
+
+func (w *Wrapper) RequiresRestart() bool {
+	return atomic.LoadUint32(&w.requiresRestart) != 0
+}
+
+func (w *Wrapper) setRequiresRestart() {
+	atomic.StoreUint32(&w.requiresRestart, 1)
+}
+
+func (w *Wrapper) StunServers() []string {
+	var addresses []string
+	for _, addr := range w.cfg.Options.StunServers {
+		switch addr {
+		case "default":
+			addresses = append(addresses, DefaultStunServers...)
+		default:
+			addresses = append(addresses, addr)
+		}
+	}
+
+	addresses = util.UniqueStrings(addresses)
+
+	// Shuffle
+	l := len(addresses)
+	for i := range addresses {
+		r := rand.Intn(l)
+		addresses[i], addresses[r] = addresses[r], addresses[i]
+	}
+
+	return addresses
 }

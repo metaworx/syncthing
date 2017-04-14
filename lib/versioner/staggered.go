@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package versioner
 
@@ -33,6 +33,9 @@ type Staggered struct {
 	folderPath    string
 	interval      [4]Interval
 	mutex         sync.Mutex
+
+	stop          chan struct{}
+	testCleanDone chan struct{}
 }
 
 func NewStaggered(folderID, folderPath string, params map[string]string) Versioner {
@@ -55,7 +58,7 @@ func NewStaggered(folderID, folderPath string, params map[string]string) Version
 		versionsDir = params["versionsPath"]
 	}
 
-	s := Staggered{
+	s := &Staggered{
 		versionsPath:  versionsDir,
 		cleanInterval: cleanInterval,
 		folderPath:    folderPath,
@@ -66,21 +69,36 @@ func NewStaggered(folderID, folderPath string, params map[string]string) Version
 			{604800, maxAge}, // next year -> 1 week between versions
 		},
 		mutex: sync.NewMutex(),
+		stop:  make(chan struct{}),
 	}
 
 	l.Debugf("instantiated %#v", s)
-
-	go func() {
-		s.clean()
-		for _ = range time.Tick(time.Duration(cleanInterval) * time.Second) {
-			s.clean()
-		}
-	}()
-
 	return s
 }
 
-func (v Staggered) clean() {
+func (v *Staggered) Serve() {
+	v.clean()
+	if v.testCleanDone != nil {
+		close(v.testCleanDone)
+	}
+
+	tck := time.NewTicker(time.Duration(v.cleanInterval) * time.Second)
+	defer tck.Stop()
+	for {
+		select {
+		case <-tck.C:
+			v.clean()
+		case <-v.stop:
+			return
+		}
+	}
+}
+
+func (v *Staggered) Stop() {
+	close(v.stop)
+}
+
+func (v *Staggered) clean() {
 	l.Debugln("Versioner clean: Waiting for lock on", v.versionsPath)
 	v.mutex.Lock()
 	defer v.mutex.Unlock()
@@ -149,7 +167,7 @@ func (v Staggered) clean() {
 	l.Debugln("Cleaner: Finished cleaning", v.versionsPath)
 }
 
-func (v Staggered) expire(versions []string) {
+func (v *Staggered) expire(versions []string) {
 	l.Debugln("Versioner: Expiring versions", versions)
 	for _, file := range v.toRemove(versions, time.Now()) {
 		if fi, err := osutil.Lstat(file); err != nil {
@@ -160,13 +178,13 @@ func (v Staggered) expire(versions []string) {
 			continue
 		}
 
-		if err := osutil.Remove(file); err != nil {
+		if err := os.Remove(file); err != nil {
 			l.Warnf("Versioner: can't remove %q: %v", file, err)
 		}
 	}
 }
 
-func (v Staggered) toRemove(versions []string, now time.Time) []string {
+func (v *Staggered) toRemove(versions []string, now time.Time) []string {
 	var prevAge int64
 	firstFile := true
 	var remove []string
@@ -218,7 +236,7 @@ func (v Staggered) toRemove(versions []string, now time.Time) []string {
 
 // Archive moves the named file away to a version archive. If this function
 // returns nil, the named file does not exist any more (has been archived).
-func (v Staggered) Archive(filePath string) error {
+func (v *Staggered) Archive(filePath string) error {
 	l.Debugln("Waiting for lock on ", v.versionsPath)
 	v.mutex.Lock()
 	defer v.mutex.Unlock()

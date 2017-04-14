@@ -56,16 +56,19 @@ func IsVersionMismatch(err error) bool {
 }
 
 func readHello(c io.Reader) (HelloResult, error) {
-	header := make([]byte, 8)
+	header := make([]byte, 4)
 	if _, err := io.ReadFull(c, header); err != nil {
 		return HelloResult{}, err
 	}
 
-	switch binary.BigEndian.Uint32(header[:4]) {
+	switch binary.BigEndian.Uint32(header) {
 	case HelloMessageMagic:
 		// This is a v0.14 Hello message in proto format
-		msgSize := binary.BigEndian.Uint32(header[4:])
-		if msgSize > 1024 {
+		if _, err := io.ReadFull(c, header[:2]); err != nil {
+			return HelloResult{}, err
+		}
+		msgSize := binary.BigEndian.Uint16(header[:2])
+		if msgSize > 32767 {
 			return HelloResult{}, fmt.Errorf("hello message too big")
 		}
 		buf := make([]byte, msgSize)
@@ -86,7 +89,10 @@ func readHello(c io.Reader) (HelloResult, error) {
 
 	case Version13HelloMagic:
 		// This is a v0.13 Hello message in XDR format
-		msgSize := binary.BigEndian.Uint32(header[4:])
+		if _, err := io.ReadFull(c, header[:4]); err != nil {
+			return HelloResult{}, err
+		}
+		msgSize := binary.BigEndian.Uint32(header[:4])
 		if msgSize > 1024 {
 			return HelloResult{}, fmt.Errorf("hello message too big")
 		}
@@ -99,11 +105,7 @@ func readHello(c io.Reader) (HelloResult, error) {
 		if err := hello.UnmarshalXDR(buf); err != nil {
 			return HelloResult{}, err
 		}
-		res := HelloResult{
-			DeviceName:    hello.DeviceName,
-			ClientName:    hello.ClientName,
-			ClientVersion: hello.ClientVersion,
-		}
+		res := HelloResult(hello)
 		return res, ErrTooOldVersion13
 
 	case 0x00010001, 0x00010000:
@@ -120,10 +122,14 @@ func writeHello(c io.Writer, h HelloIntf) error {
 	if err != nil {
 		return err
 	}
+	if len(msg) > 32767 {
+		// The header length must be a positive signed int16
+		panic("bug: attempting to serialize too large hello message")
+	}
 
-	header := make([]byte, 8)
+	header := make([]byte, 6)
 	binary.BigEndian.PutUint32(header[:4], h.Magic())
-	binary.BigEndian.PutUint32(header[4:], uint32(len(msg)))
+	binary.BigEndian.PutUint16(header[4:], uint16(len(msg)))
 
 	_, err = c.Write(append(header, msg...))
 	return err

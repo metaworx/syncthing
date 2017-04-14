@@ -1,14 +1,23 @@
 // Copyright (C) 2014 The Protocol Authors.
 
 //go:generate go run ../../script/protofmt.go bep.proto
-//go:generate protoc --proto_path=../../../../../:../../../../gogo/protobuf/protobuf:. --gogofast_out=. bep.proto
+//go:generate protoc -I ../../vendor/ -I ../../vendor/github.com/gogo/protobuf/protobuf -I . --gogofast_out=. bep.proto
 
 package protocol
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"time"
+
+	"github.com/syncthing/syncthing/lib/rand"
+	"github.com/syncthing/syncthing/lib/sha256"
+)
+
+const (
+	SyntheticDirectorySize = 128
 )
 
 var (
@@ -21,8 +30,19 @@ func (m Hello) Magic() uint32 {
 }
 
 func (f FileInfo) String() string {
-	return fmt.Sprintf("File{Name:%q, Permissions:0%o, Modified:%d, Version:%v, Length:%d, Deleted:%v, Invalid:%v, NoPermissions:%v, Blocks:%v}",
-		f.Name, f.Permissions, f.Modified, f.Version, f.Size, f.Deleted, f.Invalid, f.NoPermissions, f.Blocks)
+	switch f.Type {
+	case FileInfoTypeDirectory:
+		return fmt.Sprintf("Directory{Name:%q, Sequence:%d, Permissions:0%o, ModTime:%v, Version:%v, Deleted:%v, Invalid:%v, NoPermissions:%v}",
+			f.Name, f.Sequence, f.Permissions, f.ModTime(), f.Version, f.Deleted, f.Invalid, f.NoPermissions)
+	case FileInfoTypeFile:
+		return fmt.Sprintf("File{Name:%q, Sequence:%d, Permissions:0%o, ModTime:%v, Version:%v, Length:%d, Deleted:%v, Invalid:%v, NoPermissions:%v, Blocks:%v}",
+			f.Name, f.Sequence, f.Permissions, f.ModTime(), f.Version, f.Size, f.Deleted, f.Invalid, f.NoPermissions, f.Blocks)
+	case FileInfoTypeSymlink, FileInfoTypeDeprecatedSymlinkDirectory, FileInfoTypeDeprecatedSymlinkFile:
+		return fmt.Sprintf("Symlink{Name:%q, Type:%v, Sequence:%d, Version:%v, Deleted:%v, Invalid:%v, NoPermissions:%v, SymlinkTarget:%q}",
+			f.Name, f.Type, f.Sequence, f.Version, f.Deleted, f.Invalid, f.NoPermissions, f.SymlinkTarget)
+	default:
+		panic("mystery file type detected")
+	}
 }
 
 func (f FileInfo) IsDeleted() bool {
@@ -39,7 +59,7 @@ func (f FileInfo) IsDirectory() bool {
 
 func (f FileInfo) IsSymlink() bool {
 	switch f.Type {
-	case FileInfoTypeSymlinkDirectory, FileInfoTypeSymlinkFile, FileInfoTypeSymlinkUnknown:
+	case FileInfoTypeSymlink, FileInfoTypeDeprecatedSymlinkDirectory, FileInfoTypeDeprecatedSymlinkFile:
 		return true
 	default:
 		return false
@@ -51,14 +71,21 @@ func (f FileInfo) HasPermissionBits() bool {
 }
 
 func (f FileInfo) FileSize() int64 {
-	if f.IsDirectory() || f.IsDeleted() {
-		return 128
+	if f.Deleted {
+		return 0
+	}
+	if f.IsDirectory() || f.IsSymlink() {
+		return SyntheticDirectorySize
 	}
 	return f.Size
 }
 
 func (f FileInfo) FileName() string {
 	return f.Name
+}
+
+func (f FileInfo) ModTime() time.Time {
+	return time.Unix(f.ModifiedS, int64(f.ModifiedNs))
 }
 
 // WinsConflict returns true if "f" is the one to choose when it is in
@@ -74,10 +101,10 @@ func (f FileInfo) WinsConflict(other FileInfo) bool {
 	}
 
 	// The one with the newer modification time wins.
-	if f.Modified > other.Modified {
+	if f.ModTime().After(other.ModTime()) {
 		return true
 	}
-	if f.Modified < other.Modified {
+	if f.ModTime().Before(other.ModTime()) {
 		return false
 	}
 
@@ -87,10 +114,42 @@ func (f FileInfo) WinsConflict(other FileInfo) bool {
 }
 
 func (b BlockInfo) String() string {
-	return fmt.Sprintf("Block{%d/%d/%x}", b.Offset, b.Size, b.Hash)
+	return fmt.Sprintf("Block{%d/%d/%d/%x}", b.Offset, b.Size, b.WeakHash, b.Hash)
 }
 
 // IsEmpty returns true if the block is a full block of zeroes.
 func (b BlockInfo) IsEmpty() bool {
 	return b.Size == BlockSize && bytes.Equal(b.Hash, sha256OfEmptyBlock[:])
+}
+
+type IndexID uint64
+
+func (i IndexID) String() string {
+	return fmt.Sprintf("0x%16X", uint64(i))
+}
+
+func (i IndexID) Marshal() ([]byte, error) {
+	bs := make([]byte, 8)
+	binary.BigEndian.PutUint64(bs, uint64(i))
+	return bs, nil
+}
+
+func (i *IndexID) Unmarshal(bs []byte) error {
+	if len(bs) != 8 {
+		return errors.New("incorrect IndexID length")
+	}
+	*i = IndexID(binary.BigEndian.Uint64(bs))
+	return nil
+}
+
+func NewIndexID() IndexID {
+	return IndexID(rand.Int64())
+}
+
+func (f Folder) Description() string {
+	// used by logging stuff
+	if f.Label == "" {
+		return f.ID
+	}
+	return fmt.Sprintf("%q (%s)", f.Label, f.ID)
 }

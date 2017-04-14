@@ -1,27 +1,29 @@
 // Copyright (C) 2016 The Protocol Authors.
 
-// +build windows
-
 package protocol
 
 import "testing"
+import "reflect"
 
 func TestFixupFiles(t *testing.T) {
-	fs := []FileInfo{
-		{Name: "ok"},  // This file is OK
-		{Name: "b<d"}, // The rest should be marked as invalid
-		{Name: "b?d"},
-		{Name: "bad "},
+	files := []FileInfo{
+		{Name: "foo/bar"},
+		{Name: `foo\bar`},
+		{Name: "foo/baz"},
+		{Name: "foo/quux"},
+		{Name: `foo\fail`},
 	}
 
-	fixupFiles("default", fs)
-
-	if fs[0].IsInvalid() {
-		t.Error("fs[0] should not be invalid")
+	// Filenames should be slash converted, except files which already have
+	// backslashes in them which are instead filtered out.
+	expected := []FileInfo{
+		{Name: `foo\bar`},
+		{Name: `foo\baz`},
+		{Name: `foo\quux`},
 	}
-	for i := 1; i < len(fs); i++ {
-		if !fs[i].IsInvalid() {
-			t.Errorf("fs[%d] should be invalid", i)
-		}
+
+	fixed := fixupFiles(files)
+	if !reflect.DeepEqual(fixed, expected) {
+		t.Errorf("Got %v, expected %v", fixed, expected)
 	}
 }

@@ -2,7 +2,7 @@
 //
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
-// You can obtain one at http://mozilla.org/MPL/2.0/.
+// You can obtain one at https://mozilla.org/MPL/2.0/.
 
 package connections
 
@@ -16,8 +16,6 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
-const tcpPriority = 10
-
 func init() {
 	factory := &tcpDialerFactory{}
 	for _, scheme := range []string{"tcp", "tcp4", "tcp6"} {
@@ -30,23 +28,33 @@ type tcpDialer struct {
 	tlsCfg *tls.Config
 }
 
-func (d *tcpDialer) Dial(id protocol.DeviceID, uri *url.URL) (IntermediateConnection, error) {
-	uri = fixupPort(uri)
+func (d *tcpDialer) Dial(id protocol.DeviceID, uri *url.URL) (internalConn, error) {
+	uri = fixupPort(uri, config.DefaultTCPPort)
 
 	conn, err := dialer.DialTimeout(uri.Scheme, uri.Host, 10*time.Second)
 	if err != nil {
 		l.Debugln(err)
-		return IntermediateConnection{}, err
+		return internalConn{}, err
+	}
+
+	err = dialer.SetTCPOptions(conn)
+	if err != nil {
+		l.Infoln(err)
+	}
+
+	err = dialer.SetTrafficClass(conn, d.cfg.Options().TrafficClass)
+	if err != nil {
+		l.Debugf("failed to set traffic class: %s", err)
 	}
 
 	tc := tls.Client(conn, d.tlsCfg)
 	err = tlsTimedHandshake(tc)
 	if err != nil {
 		tc.Close()
-		return IntermediateConnection{}, err
+		return internalConn{}, err
 	}
 
-	return IntermediateConnection{tc, "TCP (Client)", tcpPriority}, nil
+	return internalConn{tc, connTypeTCPClient, tcpPriority}, nil
 }
 
 func (d *tcpDialer) RedialFrequency() time.Duration {
