@@ -31,15 +31,26 @@ type WalkFunc func(path string, info FileInfo, err error) error
 // walk recursively descends path, calling walkFn.
 func (f *BasicFilesystem) walk(path string, info FileInfo, walkFn WalkFunc) error {
 	err := walkFn(path, info, nil)
-	if err != nil {
-		if info.IsDir() && err == SkipDir {
-			return nil
-		}
-		return err
-	}
-
-	if !info.IsDir() {
-		return nil
+	switch err {
+		case nil:
+			if !info.IsDir() {
+				return nil
+			}
+		
+		case SkipDir:
+			if info.IsDir() {
+				return nil
+			}
+			return err
+		
+		case FollowSymlink:
+			if !info.IsSymlink() {
+				return err
+			}
+			path += PathSeparator
+		
+		default:
+			return err
 	}
 
 	names, err := f.DirNames(path)

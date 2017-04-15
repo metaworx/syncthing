@@ -1171,7 +1171,37 @@ func (m *Model) Request(deviceID protocol.DeviceID, folder, name string, offset 
 		return protocol.ErrNoSuchFile
 	}
 
-	if err := osutil.TraversesSymlink(folderPath, filepath.Dir(name)); err != nil {
+	pathBase := folderPath
+	pathDir  := filepath.Dir(name)
+	
+	CHECK_SYMLINK:
+	for {
+		err := osutil.TraversesSymlink(pathBase, pathDir)
+		if err == nil {
+			break
+		}
+		
+		serr, ok := err.(*osutil.TraversesSymlinkError)
+		if !ok || len(folderCfg.FollowSymlinks) == 0 {
+			break
+		}
+		
+		l.Infof("TraversingSymlink at %v - %q\n", err, pathDir)
+		for _, link := range folderCfg.FollowSymlinks {
+			if serr.Path() == link {
+				l.Debugf("%v REQ(in) traversal check: %s - %s: %q / %q o=%d s=%d (skiped as matches FollowSymlink)", m, err, deviceID, folder, name, offset, len(buf))
+				if serr.Path() == pathDir {
+					// was the last segement
+					err = nil
+					break
+				}
+				pathBase = filepath.Join(pathBase, serr.Path())
+				continue CHECK_SYMLINK
+			}
+		}
+		break;
+	}
+	if err != nil {
 		l.Debugf("%v REQ(in) traversal check: %s - %s: %q / %q o=%d s=%d", m, err, deviceID, folder, name, offset, len(buf))
 		return protocol.ErrNoSuchFile
 	}

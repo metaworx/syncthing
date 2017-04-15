@@ -28,6 +28,7 @@ const (
 	resultInclude    Result = 1 << iota
 	resultDeletable         = 1 << iota
 	resultFoldCase          = 1 << iota
+	resultDynamiclyAdded    = 1 << iota
 )
 
 type Pattern struct {
@@ -62,6 +63,10 @@ func (r Result) IsDeletable() bool {
 
 func (r Result) IsCaseFolded() bool {
 	return r&resultFoldCase == resultFoldCase
+}
+
+func (r Result) IsDynamiclyAdded() bool {
+	return r&resultDynamiclyAdded == resultDynamiclyAdded
 }
 
 type Matcher struct {
@@ -275,6 +280,24 @@ func (m *Matcher) ShouldIgnore(filename string) bool {
 	return false
 }
 
+func (m *Matcher) AddDynamicIgnore(path string) (err error) {
+	m.mut.Lock()
+	defer m.mut.Unlock()
+
+	pattern := Pattern{
+		result: getDefaultResult() | resultInclude | resultDynamiclyAdded,
+		pattern: path,
+	}
+
+	pattern.match, err = glob.Compile(path, '/')
+	if err != nil {
+		return fmt.Errorf("invalid pattern %q in ignore file (%v)", path, err)
+	}
+	m.patterns = append(m.patterns, pattern)
+	
+	return err
+}
+
 func hashPatterns(patterns []Pattern) string {
 	h := md5.New()
 	for _, pat := range patterns {
@@ -304,18 +327,22 @@ func loadIgnoreFile(file string, modtimes map[string]time.Time) ([]string, []Pat
 	return parseIgnoreFile(fd, file, modtimes)
 }
 
+func getDefaultResult() (defaultResult Result) {
+	defaultResult = resultInclude
+	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+		defaultResult |= resultFoldCase
+	}
+	
+	return defaultResult
+}
+
 func parseIgnoreFile(fd io.Reader, currentFile string, modtimes map[string]time.Time) ([]string, []Pattern, error) {
 	var lines []string
 	var patterns []Pattern
 
-	defaultResult := resultInclude
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
-		defaultResult |= resultFoldCase
-	}
-
 	addPattern := func(line string) error {
 		pattern := Pattern{
-			result: defaultResult,
+			result: getDefaultResult(),
 		}
 
 		// Allow prefixes to be specified in any order, but only once.

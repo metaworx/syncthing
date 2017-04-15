@@ -7,6 +7,7 @@
 package fs
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,6 +63,8 @@ type FileMode uint32
 // ModePerm is the equivalent of os.ModePerm
 const ModePerm = FileMode(os.ModePerm)
 
+const PathSeparator = string(os.PathSeparator)
+
 // DefaultFilesystem is the fallback to use when nothing explicitly has
 // been passed.
 var DefaultFilesystem Filesystem = NewBasicFilesystem()
@@ -70,6 +73,8 @@ var DefaultFilesystem Filesystem = NewBasicFilesystem()
 // the directory named in the call is to be skipped. It is not returned
 // as an error by any function.
 var SkipDir = filepath.SkipDir
+
+var FollowSymlink = errors.New("*do* follow symlink")
 
 // IsExist is the equivalent of os.IsExist
 var IsExist = os.IsExist

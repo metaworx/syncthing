@@ -22,6 +22,10 @@ func (e TraversesSymlinkError) Error() string {
 	return fmt.Sprintf("traverses symlink: %s", e.path)
 }
 
+func (e TraversesSymlinkError) Path() string {
+	return e.path
+}
+
 // NotADirectoryError is an error indicating an expected path is not a directory
 type NotADirectoryError struct {
 	path string
@@ -36,22 +40,16 @@ func (e NotADirectoryError) Error() string {
 // Base and name must both be clean and name must be relative to base.
 func TraversesSymlink(base, name string) error {
 	path := base
-	info, err := Lstat(path)
+	_, err := Lstat(path)
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() {
-		return &NotADirectoryError{
-			path: base,
-		}
-	}
-
 	if name == "." {
 		// The result of calling TraversesSymlink("some/where", filepath.Dir("foo"))
 		return nil
 	}
 
-	parts := strings.Split(name, string(os.PathSeparator))
+	parts := strings.Split(string(os.PathSeparator) + name, string(os.PathSeparator))
 	for _, part := range parts {
 		path = filepath.Join(path, part)
 		info, err := Lstat(path)

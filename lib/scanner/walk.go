@@ -8,7 +8,6 @@ package scanner
 
 import (
 	"errors"
-	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -88,7 +87,7 @@ type CurrentFiler interface {
 }
 
 func Walk(cfg Config) (chan protocol.FileInfo, error) {
-	w := walker{cfg}
+	w := walker{cfg, nil}
 
 	if w.CurrentFiler == nil {
 		w.CurrentFiler = noCurrentFiler{}
@@ -102,6 +101,7 @@ func Walk(cfg Config) (chan protocol.FileInfo, error) {
 
 type walker struct {
 	Config
+	pathsToCheck []string
 }
 
 // Walk returns the list of files found in the local folder by scanning the
@@ -121,7 +121,6 @@ func (w *walker) walk() (chan protocol.FileInfo, error) {
 	go func() {
 		hashFiles := w.walkAndHashFiles(toHashChan, finishedChan)
 
-		var dirs []string
 		if len(w.Subs) == 0 {
 			w.Filesystem.Walk(w.Dir, hashFiles)
 		} else {
@@ -132,45 +131,6 @@ func (w *walker) walk() (chan protocol.FileInfo, error) {
 			}
 		}
 
-		// If a there's a set of symlinks to follow, do the same for those.
-		if len(w.FollowSymlinks) > 0 {
-		nextSymlink:
-			for _, link := range w.FollowSymlinks {
-				path := filepath.Join(w.Dir, link)
-
-				// Verify that the symlink is under one of the dirs we
-				// intend to scan.
-				for _, allowed := range dirs {
-					if strings.HasPrefix(path, allowed+string(os.PathSeparator)) {
-						goto ok
-					}
-				}
-				continue nextSymlink
-
-			ok:
-				info, err := os.Stat(path)
-				if err != nil {
-					// The symlink points to something that doesn't exist. Never mind.
-					continue
-				}
-				if !info.IsDir() {
-					warnOnce.Do(func() {
-						l.Warnf("Following symlinks to files is unsupported (%s).", path)
-					})
-					continue
-				}
-
-				// Append the path separator so that the scanner will
-				// descend into the directory instead of seeing the symlink
-				// itself.
-				path += string(os.PathSeparator)
-				dirs = append(dirs, path)
-			}
-		}
-
-		for _, dir := range dirs {
-			w.Filesystem.Walk(dir, hashFiles)
-		}
 		close(toHashChan)
 	}()
 
@@ -315,12 +275,110 @@ func (w *walker) walkAndHashFiles(fchan, dchan chan protocol.FileInfo) fs.WalkFu
 		}
 
 		switch {
-		case info.Mode()&fs.FileMode(os.ModeSymlink) == fs.FileMode(os.ModeSymlink):
+		case info.IsSymlink():
 			for _, link := range w.FollowSymlinks {
 				// If the symlink is one of those we are supposed to follow,
 				// we should not treat it as a symlink when seeing it here.
 				if relPath == link {
-					return skip
+
+					target, err := filepath.EvalSymlinks(absPath)
+					if err != nil {
+						l.Infoln("readlink error:", absPath, err)
+						l.Debugln("readlink error:", absPath, err)
+						return nil
+					}
+
+					targetAbs := target
+					
+					if !filepath.IsAbs(target) {
+						targetAbs = filepath.Join(absPath, target)
+					}
+					targetAbs = filepath.Clean(targetAbs);
+					
+					l.Infoln("Found Link",relPath,"->", target, targetAbs)
+					
+					// re-read the file info for the target of the symlink.
+					// Append the path separator so that the scanner will
+					// descend into the directory instead of seeing the symlink
+					// itself.
+					info, err := w.Filesystem.Lstat(targetAbs)
+					if err != nil {
+						// The symlink points to something that doesn't exist. Never mind.
+						return nil
+					}
+					if !info.IsDir() {
+						l.Warnf("Following symlinks to files is unsupported (%s).", absPath)
+						warnOnce.Do(func() {
+							l.Warnf("Following symlinks to files is unsupported (%s).", absPath)
+						})
+						return nil
+					}
+
+					// check if symlink target is a parent of w.Dir or  w.Dir/w.Subs... respectively
+					if len(w.pathsToCheck) == 0 {
+						if len(w.Subs) == 0 {
+							target, err = filepath.EvalSymlinks(w.Dir)
+							w.pathsToCheck = append(w.pathsToCheck, target + fs.PathSeparator)
+						} else {
+							for _, sub := range w.Subs {
+								target, err = filepath.EvalSymlinks(filepath.Join(w.Dir, sub))
+								w.pathsToCheck = append(w.pathsToCheck, target + fs.PathSeparator)
+							}
+						}
+					}
+					
+					isRootParent := false
+					var myOwnRoot string;
+					
+					for _, pathToCheck := range w.pathsToCheck {
+						if myOwnRoot == "" {
+							if strings.HasPrefix(absPath, pathToCheck) {
+								myOwnRoot = pathToCheck
+							}
+						}
+						if strings.HasPrefix(pathToCheck, targetAbs + fs.PathSeparator) {
+							// add the relative path to the ignore list to prevent circular inclusion
+							target, err = filepath.Rel(targetAbs, pathToCheck)
+							err := w.Matcher.AddDynamicIgnore(filepath.Join(relPath,target))
+							if err != nil {
+								return err
+							}
+							
+							isRootParent = true
+						}
+					}
+					
+					if !isRootParent {
+						// if targetAbs is not parent of any pathsToCheck, it might still be a parent 
+						// of absPath, which would constitute another circularity
+						parent, err := filepath.EvalSymlinks(filepath.Dir(absPath))
+						if err != nil {
+							return err
+						}
+						if strings.HasPrefix(parent + fs.PathSeparator, targetAbs + fs.PathSeparator) {
+							l.Infoln("skipping ",targetAbs,"as it is parent of own directory ", parent )
+							return skip;
+						}
+						
+						//however, it might also be a child of an other w.Sub, in which case we skip it as well
+						if len(w.Subs) == 0 {
+							// check if target is a child of an other w.Sub
+							for _, pathToCheck := range w.pathsToCheck {
+								if strings.HasPrefix(targetAbs, pathToCheck) {
+									l.Infoln("skipping ",targetAbs,"as it is child of sub", pathToCheck )
+									return skip
+								}
+							}
+						}
+						
+					}
+					
+					l.Infoln("walking",relPath + string(fs.PathSeparator), info)
+					err = w.walkDir(relPath + string(fs.PathSeparator), info, dchan, true)
+					if err != nil {
+						return err
+					}
+					return fs.FollowSymlink
 				}
 			}
 
@@ -334,7 +392,7 @@ func (w *walker) walkAndHashFiles(fchan, dchan chan protocol.FileInfo) fs.WalkFu
 			return nil
 
 		case info.IsDir():
-			err = w.walkDir(relPath, info, dchan)
+			err = w.walkDir(relPath, info, dchan, false)
 
 		case info.IsRegular():
 			err = w.walkRegular(relPath, info, fchan)
@@ -392,7 +450,7 @@ func (w *walker) walkRegular(relPath string, info fs.FileInfo, fchan chan protoc
 	return nil
 }
 
-func (w *walker) walkDir(relPath string, info fs.FileInfo, dchan chan protocol.FileInfo) error {
+func (w *walker) walkDir(relPath string, info fs.FileInfo, dchan chan protocol.FileInfo, followSymlink bool) error {
 	// A directory is "unchanged", if it
 	//  - exists
 	//  - has the same permissions as previously, unless we are ignoring permissions
@@ -402,7 +460,7 @@ func (w *walker) walkDir(relPath string, info fs.FileInfo, dchan chan protocol.F
 	//  - was not invalid (since it looks valid now)
 	cf, ok := w.CurrentFiler.CurrentFile(relPath)
 	permUnchanged := w.IgnorePerms || !cf.HasPermissionBits() || PermsEqual(cf.Permissions, uint32(info.Mode()))
-	if ok && permUnchanged && !cf.IsDeleted() && cf.IsDirectory() && !cf.IsSymlink() && !cf.IsInvalid() {
+	if ok && permUnchanged && !cf.IsDeleted() && cf.IsDirectory() && (followSymlink || !cf.IsSymlink()) && !cf.IsInvalid() {
 		return nil
 	}
 
